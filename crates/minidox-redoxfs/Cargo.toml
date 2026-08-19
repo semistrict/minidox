@@ -1,0 +1,9 @@
+[package]
+name = "minidox-redoxfs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+minidox-cache.workspace = true
+redoxfs.workspace = true

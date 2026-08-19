@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "crates/minidox-cache",
+    "crates/minidox-redoxfs",
+]
+exclude = [
+    "vendor/redox-kernel",
+    "vendor/redoxfs",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+bitflags = "2.13.1"
+minidox-cache = { path = "crates/minidox-cache" }
+redoxfs = { path = "vendor/redoxfs", default-features = false, features = ["std"] }
+tempfile = "3.27.0"
