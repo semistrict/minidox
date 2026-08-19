@@ -1,0 +1,53 @@
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum IpiKind {
+    Wakeup = 0x40,
+    Tlb = 0x41,
+    Switch = 0x42,
+    Pit = 0x43,
+
+    #[cfg(feature = "profiling")]
+    Profile = 0x44,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum IpiTarget {
+    Current = 1,
+    All = 2,
+    Other = 3,
+}
+
+#[inline(always)]
+pub fn ipi(kind: IpiKind, target: IpiTarget) {
+    use crate::arch::device::local_apic::the_local_apic;
+
+    if cfg!(not(feature = "multi_core")) {
+        return;
+    }
+
+    #[cfg(feature = "profiling")]
+    if matches!(kind, IpiKind::Profile) {
+        let icr = ((target as u64) << 18) | (1 << 14) | (0b100 << 8);
+        unsafe { the_local_apic().set_icr(icr) };
+        return;
+    }
+
+    let icr = ((target as u64) << 18) | (1 << 14) | (kind as u64);
+    unsafe { the_local_apic().set_icr(icr) };
+}
+
+#[inline(always)]
+pub fn ipi_single(kind: IpiKind, target: &crate::percpu::PercpuBlock) {
+    use crate::arch::device::local_apic::the_local_apic;
+
+    if cfg!(not(feature = "multi_core")) {
+        return;
+    }
+
+    if let Some(apic_id) = target.misc_arch_info.apic_id_opt.get() {
+        unsafe {
+            the_local_apic().ipi(apic_id, kind);
+        }
+    }
+}

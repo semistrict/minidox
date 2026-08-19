@@ -1,0 +1,155 @@
+use core::arch::asm;
+
+use crate::{Arch, PhysicalAddress, TableKind, VirtualAddress};
+
+#[derive(Clone, Copy)]
+pub struct AArch64Arch;
+
+impl Arch for AArch64Arch {
+    const KERNEL_SEPARATE_TABLE: bool = true;
+
+    const PAGE_SHIFT: usize = 12; // 4096 bytes
+    const PAGE_ENTRY_SHIFT: usize = 9; // 512 entries, 8 bytes each
+    const PAGE_LEVELS: usize = 4; // L0, L1, L2, L3
+
+    //TODO
+    const ENTRY_ADDRESS_WIDTH: usize = 40;
+    const ENTRY_FLAG_DEFAULT_PAGE: usize = Self::ENTRY_FLAG_PRESENT
+        | 1 << 1 // Page flag
+        | 0b11 << 8 // SH[1:0]: Inner Shareable
+        | 1 << 10 // Access flag
+        | Self::ENTRY_FLAG_NO_GLOBAL;
+    const ENTRY_FLAG_DEFAULT_TABLE: usize
+        = Self::ENTRY_FLAG_PRESENT
+        | Self::ENTRY_FLAG_READWRITE
+        | 1 << 1 // Table flag
+        | 1 << 10 // Access flag
+        ;
+    const ENTRY_FLAG_PRESENT: usize = 1 << 0;
+    const ENTRY_FLAG_READONLY: usize = 1 << 7;
+    const ENTRY_FLAG_READWRITE: usize = 0;
+    const ENTRY_FLAG_PAGE_USER: usize = 1 << 6;
+    // This sets both userspace and privileged execute never
+    //TODO: Separate the two?
+    const ENTRY_FLAG_NO_EXEC: usize = 0b11 << 53;
+    const ENTRY_FLAG_EXEC: usize = 0;
+    const ENTRY_FLAG_GLOBAL: usize = 0;
+    const ENTRY_FLAG_NO_GLOBAL: usize = 1 << 11;
+    const ENTRY_FLAG_DEVICE_MEMORY: usize = MEM_ATTR_DEVICE_nGnRnE << 2;
+    const ENTRY_FLAG_UNCACHEABLE: usize = MEM_ATTR_NC << 2;
+    const ENTRY_FLAG_WRITE_COMBINING: usize = MEM_ATTR_NC << 2;
+
+    const PHYS_OFFSET: usize = 0xFFFF_8000_0000_0000;
+
+    #[inline(always)]
+    fn invalidate(address: VirtualAddress) {
+        unsafe {
+            asm!("
+            dsb ishst
+            tlbi vaae1is, {}
+            dsb ish
+            isb
+        ", in(reg) (address.data() >> Self::PAGE_SHIFT));
+        }
+    }
+
+    #[inline(always)]
+    fn invalidate_all() {
+        unsafe {
+            asm!(
+                "
+            dsb ishst
+            tlbi vmalle1is
+            dsb ish
+            isb
+        "
+            );
+        }
+    }
+
+    #[inline(always)]
+    fn table(table_kind: TableKind) -> PhysicalAddress {
+        let address: usize;
+        match table_kind {
+            TableKind::User => {
+                unsafe { asm!("mrs {0}, ttbr0_el1", out(reg) address) };
+            }
+            TableKind::Kernel => {
+                unsafe { asm!("mrs {0}, ttbr1_el1", out(reg) address) };
+            }
+        }
+        PhysicalAddress::new(address)
+    }
+
+    #[inline(always)]
+    unsafe fn set_table(table_kind: TableKind, address: PhysicalAddress) {
+        unsafe {
+            match table_kind {
+                TableKind::User => {
+                    asm!("msr ttbr0_el1, {0}", in(reg) address.data());
+                }
+                TableKind::Kernel => {
+                    asm!("msr ttbr1_el1, {0}", in(reg) address.data());
+                }
+            }
+            Self::invalidate_all();
+        }
+    }
+
+    fn virt_is_valid(_address: VirtualAddress) -> bool {
+        //TODO: what makes an address valid on aarch64?
+        true
+    }
+}
+
+#[cfg_attr(not(target_arch = "aarch64"), allow(unused))]
+const MEM_ATTR_WB: usize = 0;
+const MEM_ATTR_NC: usize = 1;
+#[allow(non_upper_case_globals)]
+const MEM_ATTR_DEVICE_nGnRnE: usize = 2;
+
+/// Setup Memory Access Indirection Register
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn init_mair() {
+    // https://github.com/freebsd/freebsd-src/blob/d15733065c4221dcd5bb3622d225760f271f6fc9/sys/arm64/include/armreg.h#L1986-L1991
+    const fn mair_attr(attr: u64, idx: usize) -> u64 {
+        attr << (idx * 8)
+    }
+    #[allow(non_upper_case_globals)]
+    const MAIR_DEVICE_nGnRnE: u64 = 0x00;
+    #[allow(non_upper_case_globals)]
+    const _MAIR_DEVICE_nGnRE: u64 = 0x04;
+    const MAIR_NORMAL_NC: u64 = 0x44;
+    const _MAIR_NORMAL_WT: u64 = 0xbb;
+    const MAIR_NORMAL_WB: u64 = 0xff;
+
+    unsafe {
+        let val: u64 = const {
+            mair_attr(MAIR_DEVICE_nGnRnE, MEM_ATTR_DEVICE_nGnRnE)
+                | mair_attr(MAIR_NORMAL_NC, MEM_ATTR_NC)
+                | mair_attr(MAIR_NORMAL_WB, MEM_ATTR_WB)
+        };
+
+        asm!("msr mair_el1, {}", in(reg) val);
+    }
+}
+
+const _: () = {
+    assert!(AArch64Arch::PAGE_SIZE == 4096);
+    assert!(AArch64Arch::PAGE_OFFSET_MASK == 0xFFF);
+    assert!(AArch64Arch::PAGE_ADDRESS_SHIFT == 48);
+    assert!(AArch64Arch::PAGE_ADDRESS_SIZE == 0x0001_0000_0000_0000);
+    assert!(AArch64Arch::PAGE_ADDRESS_MASK == 0x0000_FFFF_FFFF_F000);
+    assert!(AArch64Arch::PAGE_ENTRY_SIZE == 8);
+    assert!(AArch64Arch::PAGE_ENTRIES == 512);
+    assert!(AArch64Arch::PAGE_ENTRY_MASK == 0x1FF);
+    assert!(AArch64Arch::PAGE_NEGATIVE_MASK == 0xFFFF_0000_0000_0000);
+
+    assert!(AArch64Arch::ENTRY_ADDRESS_SIZE == 0x0000_0100_0000_0000);
+    assert!(AArch64Arch::ENTRY_ADDRESS_MASK == 0x0000_00FF_FFFF_FFFF);
+    assert!(AArch64Arch::ENTRY_FLAGS_MASK == 0xFFF0_0000_0000_0FFF);
+    assert!(AArch64Arch::ENTRY_FLAG_DEFAULT_PAGE & (0b11 << 8) == 0b11 << 8);
+
+    assert!(AArch64Arch::PHYS_OFFSET == 0xFFFF_8000_0000_0000);
+};

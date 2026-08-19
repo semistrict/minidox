@@ -1,0 +1,332 @@
+// TODO: This scheme can be simplified significantly, and through it, several other APIs where it's
+// dubious whether they require dedicated schemes (like irq, dtb, acpi). In particular, the kernel
+// could abandon the filesystem-like APIs here in favor of SYS_CALL, and instead let userspace wrap
+// those to say shell-accessible fs-like APIs.
+
+use ::syscall::{
+    dirent::{DirEntry, DirentBuf, DirentKind},
+    EINVAL, EIO, EISDIR, ENOTDIR, EPERM,
+};
+use alloc::{sync::Arc, vec::Vec};
+use core::str;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use crate::arch::interrupt;
+use crate::{
+    context::file::InternalFlags,
+    sync::{CleanLockToken, RwLock, L1},
+    syscall::{
+        data::Stat,
+        error::{Error, Result, EBADF, ENOENT},
+        flag::{MODE_DIR, MODE_FILE},
+        usercopy::{UserSliceRo, UserSliceWo},
+    },
+};
+
+use super::{CallerCtx, HandleMap, KernelScheme, OpenResult, StrOrBytes};
+
+mod block;
+mod context;
+mod cpu;
+mod exe;
+mod fdstat;
+mod iostat;
+mod irq;
+mod log;
+mod stat;
+mod syscall;
+mod uname;
+
+enum Handle {
+    TopLevel,
+    Resource {
+        path: &'static str,
+        kind: Kind,
+        data: Arc<RwLock<L1, Option<Vec<u8>>>>,
+    },
+    SchemeRoot,
+}
+
+#[derive(Clone, Copy)]
+enum Kind {
+    Rd(fn(&mut CleanLockToken) -> Result<Vec<u8>>),
+    Wr(fn(&[u8], &mut CleanLockToken) -> Result<usize>),
+}
+use Kind::{Rd, Wr};
+impl Kind {
+    fn generate_data(&self, token: &mut CleanLockToken) -> Result<Vec<u8>> {
+        match self {
+            Rd(handler) => handler(token),
+            Wr(_) => Err(Error::new(EISDIR)),
+        }
+    }
+}
+
+/// System information scheme
+pub struct SysScheme;
+static HANDLES: RwLock<L1, HandleMap<Handle>> = RwLock::new(HandleMap::new());
+
+const FILES: &[(&str, Kind)] = &[
+    ("block", Rd(block::resource)),
+    ("context", Rd(context::resource)),
+    ("cpu", Rd(cpu::resource)),
+    #[cfg(feature = "sys_fdstat")]
+    ("fdstat", Rd(fdstat::resource)),
+    ("exe", Rd(exe::resource)),
+    ("iostat", Rd(iostat::resource)),
+    ("irq", Rd(irq::resource)),
+    ("log", Rd(log::resource)),
+    ("numa", Rd(crate::numa::get_numa_info)),
+    ("numa_dist", Rd(crate::numa::get_numa_distance_info)),
+    ("numa_dom", Rd(crate::numa::get_numa_dom_info)),
+    ("syscall", Rd(syscall::resource)),
+    ("uname", Rd(uname::resource)),
+    ("env", Rd(|_| Ok(Vec::from(crate::startup::init_env())))),
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    ("spurious_irq", Rd(interrupt::irq::spurious_irq_resource)),
+    ("stat", Rd(stat::resource)),
+    // Disabled because the debugger is inherently unsafe and probably will break the system.
+    /*
+    ("trigger_debugger", Rd(|token| unsafe {
+        crate::debugger::debugger(None, token);
+        Ok(Vec::new())
+    })),
+    */
+    (
+        "update_time_offset",
+        Wr(crate::time::sys_update_time_offset),
+    ),
+    (
+        "kstop",
+        Wr(|arg, token| unsafe {
+            match arg.trim_ascii() {
+                b"shutdown" => crate::stop::kstop(token),
+                b"reset" => crate::stop::kreset(),
+                b"emergency_reset" => crate::stop::emergency_reset(),
+                _ => Err(Error::new(EINVAL)),
+            }
+        }),
+    ),
+];
+
+impl KernelScheme for SysScheme {
+    fn scheme_root(&self, token: &mut CleanLockToken) -> Result<usize> {
+        let id = HANDLES.write(token.token()).insert(Handle::SchemeRoot);
+        Ok(id)
+    }
+    fn kopenat(
+        &self,
+        _id: usize,
+        user_buf: StrOrBytes,
+        _flags: usize,
+        _fcntl_flags: u32,
+        ctx: CallerCtx,
+        token: &mut CleanLockToken,
+    ) -> Result<OpenResult> {
+        let path = user_buf
+            .as_str()
+            .or(Err(Error::new(EINVAL)))?
+            .trim_matches('/');
+
+        if path.is_empty() {
+            let id = HANDLES.write(token.token()).insert(Handle::TopLevel);
+
+            Ok(OpenResult::SchemeLocal(id, InternalFlags::POSITIONED))
+        } else {
+            //Have to iterate to get the path without allocation
+            let entry = FILES
+                .iter()
+                .find(|(entry_path, _)| *entry_path == path)
+                .ok_or(Error::new(ENOENT))?;
+
+            if matches!(entry.1, Wr(_)) && ctx.uid != 0 {
+                return Err(Error::new(EPERM));
+            }
+
+            // TODO: Initialize resources during openat to use them as a snapshot.
+            let id = HANDLES.write(token.token()).insert(Handle::Resource {
+                path: entry.0,
+                kind: entry.1,
+                data: Arc::new(RwLock::new(None)),
+            });
+            Ok(OpenResult::SchemeLocal(id, InternalFlags::POSITIONED))
+        }
+    }
+
+    fn fsize(&self, id: usize, token: &mut CleanLockToken) -> Result<u64> {
+        let (kind, data_lock) = {
+            match HANDLES.read(token.token()).get(id)? {
+                Handle::TopLevel => return Ok(0),
+                Handle::Resource { kind, data, .. } => (*kind, data.clone()),
+                Handle::SchemeRoot => return Err(Error::new(EBADF)),
+            }
+        };
+        if matches!(kind, Kind::Wr(_)) {
+            return Ok(0);
+        }
+        let is_data_none = data_lock.read(token.token()).is_none();
+        if is_data_none {
+            let new_data = kind.generate_data(token)?;
+            let mut data_guard = data_lock.write(token.token());
+            if data_guard.is_none() {
+                *data_guard = Some(new_data);
+            }
+        }
+        let data_guard = data_lock.read(token.token());
+        let data = data_guard.as_ref().ok_or(Error::new(EIO))?;
+
+        Ok(data.len() as u64)
+    }
+
+    fn close(&self, id: usize, token: &mut CleanLockToken) -> Result<()> {
+        HANDLES.write(token.token()).remove(id)?;
+        Ok(())
+    }
+    fn kfpath(&self, id: usize, buf: UserSliceWo, token: &mut CleanLockToken) -> Result<usize> {
+        let path = match HANDLES.read(token.token()).get(id)? {
+            Handle::TopLevel => "",
+            Handle::Resource { path, .. } => path,
+            Handle::SchemeRoot => return Err(Error::new(EBADF)),
+        };
+
+        const FIRST: &[u8] = b"/scheme/sys/";
+        let mut bytes_read = buf.copy_common_bytes_from_slice(FIRST)?;
+
+        if let Some(remaining) = buf.advance(FIRST.len()) {
+            bytes_read += remaining.copy_common_bytes_from_slice(path.as_bytes())?;
+        }
+
+        Ok(bytes_read)
+    }
+    fn kreadoff(
+        &self,
+        id: usize,
+        buffer: UserSliceWo,
+        pos: u64,
+        _flags: u32,
+        _stored_flags: u32,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        let Ok(pos) = usize::try_from(pos) else {
+            return Ok(0);
+        };
+
+        let (kind, data_lock) = {
+            match HANDLES.read(token.token()).get(id)? {
+                Handle::Resource { kind, data, .. } => (*kind, data.clone()),
+                _ => return Err(Error::new(EBADF)),
+            }
+        };
+        let is_data_none = data_lock.read(token.token()).is_none();
+        if is_data_none {
+            let new_data = kind.generate_data(token)?;
+            let mut data_guard = data_lock.write(token.token());
+            if data_guard.is_none() {
+                *data_guard = Some(new_data);
+            }
+        }
+        let data_guard = data_lock.read(token.token());
+        let data = data_guard.as_ref().ok_or(Error::new(EIO))?;
+        let avail_buf = data.get(pos..).unwrap_or(&[]);
+        buffer.copy_common_bytes_from_slice(avail_buf)
+    }
+    fn kwriteoff(
+        &self,
+        id: usize,
+        buffer: UserSliceRo,
+        _pos: u64,
+        _flags: u32,
+        _stored_flags: u32,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        let (handler, intermediate, len) = match HANDLES.read(token.token()).get(id)? {
+            Handle::TopLevel
+            | Handle::Resource {
+                kind: Kind::Rd(_), ..
+            } => return Err(Error::new(EISDIR)),
+            Handle::Resource {
+                kind: Kind::Wr(handler),
+                ..
+            } => {
+                let mut intermediate = [0_u8; 256];
+                let len = buffer.copy_common_bytes_to_slice(&mut intermediate)?;
+                (*handler, intermediate, len)
+            }
+            Handle::SchemeRoot => return Err(Error::new(EBADF)),
+        };
+        handler(&intermediate[..len], token)
+    }
+    fn getdents(
+        &self,
+        id: usize,
+        buf: UserSliceWo,
+        header_size: u16,
+        first_index: u64,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        let Ok(first_index) = usize::try_from(first_index) else {
+            return Ok(0);
+        };
+        match HANDLES.read(token.token()).get(id)? {
+            Handle::Resource { .. } => Err(Error::new(ENOTDIR)),
+            Handle::TopLevel => {
+                let mut buf = DirentBuf::new(buf, header_size).ok_or(Error::new(EIO))?;
+                for (this_idx, (name, _)) in FILES.iter().enumerate().skip(first_index) {
+                    buf.entry(DirEntry {
+                        inode: this_idx as u64,
+                        next_opaque_id: this_idx as u64 + 1,
+                        kind: DirentKind::Regular,
+                        name,
+                    })?;
+                }
+                Ok(buf.finalize())
+            }
+            Handle::SchemeRoot => Err(Error::new(EBADF)),
+        }
+    }
+
+    fn kfstat(&self, id: usize, buf: UserSliceWo, token: &mut CleanLockToken) -> Result<()> {
+        let stat_base = {
+            let handles = HANDLES.read(token.token());
+            match handles.get(id)? {
+                Handle::Resource { kind, data, .. } => Some((*kind, data.clone())),
+                Handle::TopLevel => None,
+                Handle::SchemeRoot => return Err(Error::new(EBADF)),
+            }
+        };
+        let stat = if let Some((kind, data_lock)) = stat_base {
+            let is_data_none = data_lock.read(token.token()).is_none();
+            if is_data_none {
+                let new_data = kind.generate_data(token)?;
+                let mut data_guard = data_lock.write(token.token());
+                if data_guard.is_none() {
+                    *data_guard = Some(new_data);
+                }
+            }
+            let data_guard = data_lock.read(token.token());
+            let data = data_guard.as_ref().ok_or(Error::new(EIO))?;
+            let size = match kind {
+                Kind::Rd(_) => data.len() as u64,
+                Kind::Wr(_) => 0,
+            };
+            Stat {
+                st_mode: 0o666 | MODE_FILE,
+                st_uid: 0,
+                st_gid: 0,
+                st_size: size,
+                ..Default::default()
+            }
+        } else {
+            Stat {
+                st_mode: 0o444 | MODE_DIR,
+                st_uid: 0,
+                st_gid: 0,
+                st_size: 0,
+                ..Default::default()
+            }
+        };
+        buf.copy_exactly(&stat)?;
+
+        Ok(())
+    }
+}

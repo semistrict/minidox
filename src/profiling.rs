@@ -1,0 +1,446 @@
+use alloc::{boxed::Box, vec::Vec};
+use core::{
+    cell::{SyncUnsafeCell, UnsafeCell},
+    mem::size_of,
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering},
+};
+#[cfg(target_arch = "x86_64")]
+use rmm::Arch;
+
+#[cfg(feature = "profiling")]
+use crate::arch::{idt::Idt, interrupt::irq::aux_timer};
+
+use crate::{
+    arch::{
+        interrupt::{self, InterruptStack},
+        CurrentRmmArch,
+    },
+    cpu_set::LogicalCpuId,
+    memory::VirtualAddress,
+    percpu::PercpuBlock,
+    syscall::{error::*, usercopy::UserSliceWo},
+};
+
+#[cfg(all(feature = "profiling", not(target_arch = "x86_64")))]
+compile_error!("Profiling not supported outside x86_64");
+
+const N: usize = 16 * 1024 * 1024;
+
+pub struct RingBuffer {
+    head: AtomicUsize,
+    tail: AtomicUsize,
+    buf: &'static [UnsafeCell<usize>; N],
+    pub(crate) nmi_kcount: AtomicUsize,
+    pub(crate) nmi_ucount: AtomicUsize,
+}
+
+impl RingBuffer {
+    unsafe fn advance_head(&self, n: usize) {
+        self.head.store(
+            self.head.load(Ordering::Acquire).wrapping_add(n),
+            Ordering::Release,
+        );
+    }
+    unsafe fn advance_tail(&self, n: usize) {
+        self.tail.store(
+            self.tail.load(Ordering::Acquire).wrapping_add(n),
+            Ordering::Release,
+        );
+    }
+    unsafe fn sender_owned(&self) -> [&[UnsafeCell<usize>]; 2] {
+        let head = self.head.load(Ordering::Acquire) % N;
+        let tail = self.tail.load(Ordering::Acquire) % N;
+
+        if head <= tail {
+            [&self.buf[tail..], &self.buf[..head]]
+        } else {
+            [&self.buf[tail..head], &[]]
+        }
+    }
+    unsafe fn receiver_owned(&self) -> [&[UnsafeCell<usize>]; 2] {
+        let head = self.head.load(Ordering::Acquire) % N;
+        let tail = self.tail.load(Ordering::Acquire) % N;
+
+        if head > tail {
+            [&self.buf[head..], &self.buf[..tail]]
+        } else {
+            [&self.buf[head..tail], &[]]
+        }
+    }
+    pub unsafe fn extend(&self, mut slice: &[usize]) -> usize {
+        let mut n = 0;
+        for mut sender_slice in unsafe { self.sender_owned() } {
+            while !slice.is_empty() && !sender_slice.is_empty() {
+                unsafe { sender_slice[0].get().write(slice[0]) };
+                slice = &slice[1..];
+                sender_slice = &sender_slice[1..];
+                n += 1;
+            }
+        }
+        unsafe { self.advance_tail(n) };
+        n
+    }
+    pub unsafe fn peek(&self) -> [&[usize]; 2] {
+        unsafe {
+            self.receiver_owned()
+                .map(|slice| core::slice::from_raw_parts(slice.as_ptr().cast(), slice.len()))
+        }
+    }
+    pub unsafe fn advance(&self, n: usize) {
+        unsafe { self.advance_head(n) }
+    }
+    pub fn create() -> &'static Self {
+        Box::leak(Box::new(Self {
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            buf: Box::leak(unsafe { Box::new_zeroed().assume_init() }),
+            nmi_kcount: AtomicUsize::new(0),
+            nmi_ucount: AtomicUsize::new(0),
+        }))
+    }
+}
+
+// SAFETY: must only be written by BSP, then constant
+// TODO: probably insignificant, but maybe perf can be improved by replacing AtmomicPtr with
+// SyncUnsafeCell?
+static BUFS_RAW: SyncUnsafeCell<&'static [AtomicPtr<RingBuffer>]> = SyncUnsafeCell::new(&[]);
+
+pub fn bufs() -> &'static [AtomicPtr<RingBuffer>] {
+    unsafe { *BUFS_RAW.get() }
+}
+
+pub const PROFILE_TOGGLEABLE: bool = true;
+pub static IS_PROFILING: AtomicBool = AtomicBool::new(false);
+
+pub fn serio_command(index: usize, data: u8) {
+    if cfg!(not(feature = "profiling")) {
+        return;
+    }
+
+    if PROFILE_TOGGLEABLE {
+        if index == 0 && data == 30 {
+            // "a" key in QEMU
+            info!("Enabling profiling");
+            IS_PROFILING.store(true, Ordering::SeqCst);
+        } else if index == 0 && data == 48 {
+            // "b" key
+            info!("Disabling profiling");
+            IS_PROFILING.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg_attr(not(feature = "profiling"), expect(dead_code))]
+pub fn drain_buffer(cpu_num: LogicalCpuId, buf: UserSliceWo) -> Result<usize> {
+    unsafe {
+        let Some(src) = bufs()
+            .get(cpu_num.get() as usize)
+            .ok_or(Error::new(EBADFD))?
+            .load(Ordering::Relaxed)
+            .as_ref()
+        else {
+            return Ok(0);
+        };
+        let byte_slices = src.peek().map(|words| {
+            core::slice::from_raw_parts(words.as_ptr().cast::<u8>(), size_of_val(words))
+        });
+
+        let copied_1 = buf.copy_common_bytes_from_slice(byte_slices[0])?;
+        src.advance(copied_1 / size_of::<usize>());
+
+        let copied_2 = if let Some(remaining) = buf.advance(copied_1) {
+            remaining.copy_common_bytes_from_slice(byte_slices[1])?
+        } else {
+            0
+        };
+        src.advance(copied_2 / size_of::<usize>());
+
+        Ok(copied_1 + copied_2)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn nmi_handler(stack: &InterruptStack) {
+    // Inside an NMI handler, so don't acquire any locks or trigger any page faults or other
+    // exceptions!
+
+    if cfg!(not(feature = "profiling")) {
+        return;
+    }
+
+    let percpu = crate::percpu::PercpuBlock::current();
+    let Some(profiling) = percpu.profiling else {
+        return;
+    };
+    if !IS_PROFILING.load(Ordering::Relaxed) {
+        return;
+    }
+    let user_not_kernel = if stack.iret.cs & 0b11 == 0b11 {
+        profiling.nmi_ucount.fetch_add(1, Ordering::Relaxed);
+
+        true
+    } else if stack.iret.rflags & (1 << 9) != 0 {
+        // Interrupts were enabled, i.e. we were in kmain, so ignore.
+        return;
+    } else {
+        profiling.nmi_kcount.fetch_add(1, Ordering::Relaxed);
+
+        false
+    };
+
+    let mut buf = [0_usize; 32];
+    buf[0] = 0xfedfac00; // allows 8-bit length
+    buf[1] = stack.iret.rip;
+    buf[2] = unsafe { x86::time::rdtsc() } as usize;
+
+    #[cfg(feature = "profiling")]
+    {
+        buf[3] = percpu
+            .switch_internals
+            .current_dbg_id
+            .load(Ordering::Relaxed) as usize;
+    }
+
+    let mut len = 4;
+
+    #[cfg(feature = "profiling")]
+    if user_not_kernel {
+        unsafe {
+            walk_ustack(stack.preserved.rbp, &mut buf, &mut len);
+        }
+    } else {
+        // TODO: Support walking past a syscall boundary? If so, should be sufficient to check
+        // against syscall_instruction, then get registers from InterruptStack and call walk_ustack
+        // on the rest.
+        unsafe {
+            walk_kstack(stack.preserved.rbp, &mut buf, &mut len);
+        }
+    }
+
+    buf[0] |= len;
+
+    let _ = unsafe { profiling.extend(&buf[..len]) };
+}
+#[cfg(feature = "profiling")]
+unsafe fn walk_ustack(mut bp: usize, buf: &mut [usize; 32], len: &mut usize) {
+    // Runs inside an NMI handler!
+
+    // It's pretty unsafe to do this without locks, but we can pretend it's the CPU that is
+    // resolving the mappings. We already track logical CPU usage bits in each address space,
+    // forbidding any page table modifications until the kernel has switched away from this
+    // context, and any modifications will also need to wait for TLB shootdown, which this NMI will
+    // postpone due to disabled interrupts.
+    let mapper =
+        unsafe { rmm::PageMapper::<CurrentRmmArch, ()>::current(rmm::TableKind::User, ()) };
+
+    #[expect(clippy::needless_range_loop)]
+    for i in *len..32 {
+        // Unlike in kernel mode, we don't know where the user executable starts or ends, but this
+        // can be post-processed later by profiled. However, some criteria can be applied such as
+        // the 16-byte alignedness of bp, and whether the next page is mapped at all.
+
+        if bp >= crate::USER_END_OFFSET
+            || bp % 16 > 0
+            || !CurrentRmmArch::virt_is_valid(VirtualAddress::new(bp))
+        {
+            break;
+        }
+        // Since we are reading 16 bytes and bp is aligned to 16 bytes, this can't span a page
+        // boundary!
+
+        let Some((bp_frame, bp_flags)) = mapper.translate(VirtualAddress::new(bp)) else {
+            break;
+        };
+        if !bp_flags.has_user() || !bp_flags.has_write() {
+            break;
+        }
+
+        let [next_bp, ip] =
+            unsafe { (CurrentRmmArch::phys_to_virt(bp_frame).data() as *const [usize; 2]).read() };
+        if ip >= crate::USER_END_OFFSET || !CurrentRmmArch::virt_is_valid(VirtualAddress::new(ip)) {
+            break;
+        }
+
+        buf[i] = ip;
+        bp = next_bp;
+        *len = i + 1;
+    }
+}
+#[cfg(feature = "profiling")]
+unsafe fn walk_kstack(mut bp: usize, buf: &mut [usize; 32], len: &mut usize) {
+    // Runs inside an NMI handler!
+
+    #[expect(clippy::needless_range_loop)]
+    for i in *len..32 {
+        if bp < CurrentRmmArch::PHYS_OFFSET
+            || bp.saturating_add(16) >= CurrentRmmArch::PHYS_OFFSET + crate::PML4_SIZE
+        {
+            break;
+        }
+        let ip = unsafe { ((bp + 8) as *const usize).read() };
+        bp = unsafe { (bp as *const usize).read() };
+
+        if ip < crate::kernel_executable_offsets::__text_start()
+            || ip >= crate::kernel_executable_offsets::__text_end()
+        {
+            break;
+        }
+        buf[i] = ip;
+
+        *len = i + 1;
+
+        let start = crate::arch::interrupt::syscall::syscall_instruction as *const () as usize;
+        let end = crate::arch::interrupt::syscall::__syscall_instruction_end as *const () as usize;
+
+        if ip >= start && ip <= end {
+            let stack = unsafe {
+                &*((*crate::arch::x86_64::gdt::pcr()).tss.rsp[0] as *const InterruptStack).sub(1)
+            };
+            if *len >= buf.len() {
+                break;
+            }
+            buf[*len] = stack.iret.rip;
+            *len += 1;
+            unsafe {
+                walk_ustack(stack.preserved.rbp, buf, len);
+            }
+            break;
+        }
+    }
+}
+
+static NUM_ORDINARY_CPUS: AtomicU32 = AtomicU32::new(u32::MAX);
+
+#[cfg(feature = "profiling")]
+pub fn cpu_exists(cpu: LogicalCpuId) -> bool {
+    cpu.get() < NUM_ORDINARY_CPUS.load(Ordering::Relaxed)
+}
+
+fn profiler_cpu() -> LogicalCpuId {
+    #[cfg(feature = "profiling")]
+    return LogicalCpuId::new(NUM_ORDINARY_CPUS.load(Ordering::SeqCst));
+
+    #[cfg(not(feature = "profiling"))]
+    return LogicalCpuId::new(u32::MAX);
+}
+
+// SAFETY: must be called before any init()
+pub unsafe fn allocate(total_cpu_count: u32) {
+    if cfg!(not(feature = "profiling")) {
+        return;
+    }
+
+    info!("Preliminary number of CPUs: {total_cpu_count}");
+
+    let ordinary_cpu_count = total_cpu_count.checked_sub(1).unwrap();
+    NUM_ORDINARY_CPUS.store(ordinary_cpu_count, Ordering::SeqCst);
+
+    let slice = Box::leak(
+        ((0..ordinary_cpu_count as usize)
+            .map(|_| AtomicPtr::new(core::ptr::null_mut()))
+            .collect::<Vec<_>>())
+        .into_boxed_slice(),
+    );
+    unsafe {
+        BUFS_RAW.get().write(slice);
+    }
+}
+
+// SAFETY: must be called after allocate() or data races may occur
+pub unsafe fn init() {
+    if cfg!(not(feature = "profiling")) {
+        return;
+    }
+
+    let percpu = PercpuBlock::current();
+
+    if percpu.cpu_id == profiler_cpu() {
+        return;
+    }
+
+    let profiling = RingBuffer::create();
+
+    bufs()[percpu.cpu_id.get() as usize].store(
+        (profiling as *const RingBuffer).cast_mut(),
+        core::sync::atomic::Ordering::SeqCst,
+    );
+    unsafe {
+        (core::ptr::addr_of!(percpu.profiling) as *mut Option<&'static RingBuffer>)
+            .write(Some(profiling));
+    }
+}
+
+static ACK: AtomicU32 = AtomicU32::new(0);
+
+pub fn ready_for_profiling() {
+    if cfg!(not(feature = "profiling")) {
+        return;
+    }
+
+    ACK.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn maybe_run_profiling_helper_forever(cpu_id: LogicalCpuId) {
+    if cfg!(not(feature = "profiling")) {
+        return;
+    }
+
+    if cpu_id != profiler_cpu() {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        for i in 33..255 {
+            crate::arch::idt::IDTS
+                .write()
+                .get_mut(&cpu_id)
+                .unwrap()
+                .entries[i]
+                .set_func(crate::arch::interrupt::ipi::wakeup);
+        }
+
+        let apic = &mut crate::arch::device::local_apic::the_local_apic();
+        apic.set_lvt_timer((0b01 << 17) | 32);
+        apic.set_div_conf(0b1011);
+        apic.set_init_count(0x000f_ffff);
+
+        while ACK.load(Ordering::Relaxed) < NUM_ORDINARY_CPUS.load(Ordering::SeqCst) {
+            core::hint::spin_loop();
+        }
+
+        interrupt::enable_and_nop();
+        loop {
+            interrupt::halt();
+        }
+    }
+}
+
+#[cfg(feature = "profiling")]
+pub fn maybe_setup_timer(idt: &mut Idt, cpu_id: LogicalCpuId) {
+    if cfg!(not(feature = "profiling")) {
+        return;
+    }
+
+    if cpu_id != profiler_cpu() {
+        return;
+    }
+    idt.entries[32].set_func(aux_timer);
+    idt.set_reserved_mut(32, true);
+}
+#[cfg(feature = "profiling")]
+pub static DBG_ID_MAP: crate::sync::RwLock<
+    crate::sync::L1,
+    hashbrown::HashMap<u32, arrayvec::ArrayString<32>>,
+> = crate::sync::RwLock::new(hashbrown::HashMap::with_hasher(
+    hashbrown::hash_map::DefaultHashBuilder::new(),
+));
+
+#[cfg(feature = "profiling")]
+pub fn lookup_dbg_id(
+    id: u32,
+    token: &mut crate::sync::CleanLockToken,
+) -> Option<arrayvec::ArrayString<32>> {
+    // TODO: Map is necessary to track contexts that were removed afterwards. However, this
+    // function should also scan for contexts that currently exist.
+    DBG_ID_MAP.read(token.token()).get(&id).copied()
+}
