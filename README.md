@@ -38,10 +38,10 @@ Set `MINIDOX_LIMA_GUEST_DAX=1` on a nested-KVM host that supports guest
 `devm_memremap_pages()` for the DAX BAR; this additionally makes both forked
 guests cold-mmap the same untouched file and asserts one shared cache page.
 
-On a native x86-64 Linux KVM host, `scripts/test-linux-kvm.sh` builds the guest
-verifier from the running kernel and runs that guest-DAX assertion directly.
-`scripts/setup-gce-host.sh` prepares a fresh Debian host for the test.
-`scripts/test-gce.sh` creates a nested-virtualization GCE VM in `us-east1-b`,
-runs the native test, and deletes the VM even when setup or testing fails.
+`python3 scripts/test-gce.py` creates a nested-virtualization GCE VM in
+`us-east1-b`, prepares the fresh Debian host, builds the guest verifier from its
+running kernel, runs the guest-DAX assertion, and deletes the VM even when setup
+or testing fails. On an already-prepared native x86-64 Linux KVM host, pass
+`--native` to run the same test without provisioning GCE.
 Override its project, zone, machine type, or instance name with the corresponding
 `MINIDOX_GCE_*` environment variable.
