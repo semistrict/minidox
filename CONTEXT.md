@@ -32,6 +32,10 @@ _Avoid_: Filesystem clone, VM volume
 An immutable point in a Filesystem Branch's history that can be shared as the common ancestor of branches created by a fork.
 _Avoid_: Snapshot, version
 
+**Filesystem Lineage**:
+All Filesystem Branches connected by fork ancestry. A lineage has one shared logical page cache independent of any VM's lifetime.
+_Avoid_: Per-VM cache, cache pool
+
 **Durable Fork**:
 A fork whose Child VM and Filesystem Generation must survive host power loss once creation succeeds.
 _Avoid_: Persistent clone, synced fork
@@ -39,6 +43,10 @@ _Avoid_: Persistent clone, synced fork
 **Branch Capability**:
 The authority granted to one VM connection to access exactly one Filesystem Branch.
 _Avoid_: Branch ID, filesystem token
+
+**File Object**:
+The identity of one file preserved across forks until a branch replaces that file. It distinguishes the same inherited file from an unrelated file that later reuses a local inode number.
+_Avoid_: Branch-local inode
 
 **Shared Page**:
 A page whose contents have not diverged since a fork and remain shared by the Source VM and its children.

@@ -2,11 +2,13 @@
 
 Shared Redox filesystem and page cache for microVMs over virtiofs DAX.
 
-The page cache is extracted from RedoxFS's `Fmap` and `FileMmapInfo` design:
-one page-aligned backing object per inode, shared mapping refcounts, versioned
-invalidation, load-on-map, and writeback on unmap or sync. A host file replaces
-the scheme process's anonymous mapping so a virtiofs device can install the same
-pages into the DAX windows of multiple VMs.
+The page cache is extracted from RedoxFS's `Fmap` and `FileMmapInfo` design.
+One Supervisor-owned cache serves every VM in a filesystem lineage. Entries are
+keyed by stable Redox file-object identity, page offset, and the page version
+visible to a branch; unchanged forks therefore cold-fault one backing page,
+while writes create page-granular CoW identities. A host file replaces the
+scheme process's anonymous mapping so virtiofs can install the same page into
+the DAX windows of multiple VMs.
 
 ## Workspace
 
@@ -32,3 +34,6 @@ and contain a readable arm64 kernel at `/var/tmp/Image-arm64`; override the inst
 and kernel path with `MINIDOX_LIMA_INSTANCE` and `MINIDOX_LIMA_KERNEL`. The
 default kernel path is `/var/tmp/Image-arm64`; the runner includes the matching
 installed virtio-fs module, overridable with `MINIDOX_LIMA_VIRTIOFS_MODULE`.
+Set `MINIDOX_LIMA_GUEST_DAX=1` on a nested-KVM host that supports guest
+`devm_memremap_pages()` for the DAX BAR; this additionally makes both forked
+guests cold-mmap the same untouched file and asserts one shared cache page.

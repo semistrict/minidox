@@ -2,7 +2,9 @@
 
 mod branching;
 
-pub use branching::{BlockAccounting, DirectoryEntry, NodeMetadata, RedoxBranch};
+pub use branching::{
+    BlockAccounting, DirectoryEntry, NodeMetadata, RedoxBranch, RedoxPageIdentity,
+};
 
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};

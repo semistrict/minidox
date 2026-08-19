@@ -1,6 +1,79 @@
 use minidox_fork::{PAGE_SIZE, Supervisor};
 
 #[test]
+fn sibling_forks_share_a_file_page_first_loaded_after_the_fork() {
+    let mut supervisor = Supervisor::new();
+    let source = supervisor.create_vm().unwrap();
+    let file = supervisor
+        .create_file(source, "cold-data", PAGE_SIZE as u64)
+        .unwrap();
+    let first_child = supervisor.fork_vm(source).unwrap();
+    let second_child = supervisor.fork_vm(source).unwrap();
+
+    assert_eq!(supervisor.page_accounting().filesystem.resident_pages, 0);
+    assert_eq!(
+        supervisor
+            .read_file(first_child, file, 0, PAGE_SIZE)
+            .unwrap(),
+        vec![0; PAGE_SIZE]
+    );
+    assert_eq!(
+        supervisor
+            .read_file(second_child, file, 0, PAGE_SIZE)
+            .unwrap(),
+        vec![0; PAGE_SIZE]
+    );
+
+    let pages = supervisor.page_accounting().filesystem;
+    assert_eq!(pages.resident_pages, 1);
+    assert_eq!(pages.shared_pages, 1);
+}
+
+#[test]
+fn recursive_forks_share_a_cold_page_until_one_branch_writes_it() {
+    let mut supervisor = Supervisor::new();
+    let source = supervisor.create_vm().unwrap();
+    let file = supervisor
+        .create_file(source, "recursive-cold-data", PAGE_SIZE as u64)
+        .unwrap();
+    let child = supervisor.fork_vm(source).unwrap();
+    let grandchild = supervisor.fork_vm(child).unwrap();
+    let sibling = supervisor.fork_vm(source).unwrap();
+
+    assert_eq!(
+        supervisor.read_file(sibling, file, 0, PAGE_SIZE).unwrap(),
+        vec![0; PAGE_SIZE]
+    );
+    assert_eq!(
+        supervisor
+            .read_file(grandchild, file, 0, PAGE_SIZE)
+            .unwrap(),
+        vec![0; PAGE_SIZE]
+    );
+    let cold = supervisor.page_accounting().filesystem;
+    assert_eq!(cold.resident_pages, 1);
+    assert_eq!(cold.shared_pages, 1);
+
+    supervisor
+        .write_file(child, file, 0, b"child page")
+        .unwrap();
+
+    assert_eq!(supervisor.read_file(source, file, 0, 10).unwrap(), [0; 10]);
+    assert_eq!(supervisor.read_file(sibling, file, 0, 10).unwrap(), [0; 10]);
+    assert_eq!(
+        supervisor.read_file(grandchild, file, 0, 10).unwrap(),
+        [0; 10]
+    );
+    assert_eq!(
+        supervisor.read_file(child, file, 0, 10).unwrap(),
+        b"child page"
+    );
+    let diverged = supervisor.page_accounting().filesystem;
+    assert_eq!(diverged.resident_pages, 2);
+    assert_eq!(diverged.shared_pages, 1);
+}
+
+#[test]
 fn multiple_vms_reading_a_base_file_do_not_duplicate_page_cache() {
     let mut supervisor = Supervisor::new();
     let source = supervisor.create_vm().unwrap();

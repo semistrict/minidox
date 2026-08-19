@@ -4,7 +4,16 @@ set -eu
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 instance=${MINIDOX_LIMA_INSTANCE:-default}
 kernel=${MINIDOX_LIMA_KERNEL:-/var/tmp/Image-arm64}
-kernel_release=$(limactl shell "$instance" -- uname -r | tr -d '\r')
+kernel_release=${MINIDOX_LIMA_KERNEL_RELEASE:-}
+if [ -z "$kernel_release" ]; then
+    kernel_release=$(limactl shell "$instance" -- strings "$kernel" |
+        sed -n 's/^Linux version \([^ ]*\).*/\1/p' |
+        head -n 1 |
+        tr -d '\r')
+fi
+if [ -z "$kernel_release" ]; then
+    kernel_release=$(limactl shell "$instance" -- uname -r | tr -d '\r')
+fi
 virtiofs_module=${MINIDOX_LIMA_VIRTIOFS_MODULE:-/lib/modules/$kernel_release/kernel/fs/fuse/virtiofs.ko.zst}
 run_id="$(date +%s)-$$"
 guest_work="/tmp/minidox-lima-test-$run_id"
@@ -61,11 +70,21 @@ limactl shell --workdir="$guest_work" "$instance" -- \
 limactl shell --workdir="$guest_work/vendor/cloud-hypervisor" "$instance" -- \
     env CARGO_TARGET_DIR="$guest_target" cargo test -p virtio-devices \
         in_process_fs --features kvm --locked
-limactl shell --workdir="$guest_work" "$instance" -- \
-    env CARGO_TARGET_DIR="$guest_target" \
-        MINIDOX_TEST_KERNEL="$kernel" \
-        MINIDOX_TEST_INITRAMFS="$guest_initramfs" \
-        MINIDOX_TEST_CONSOLE="$guest_console" \
-        MINIDOX_TEST_VIRTIOFS=1 \
-        cargo test -p minidox-vmm --test cloud_hypervisor_fork_state \
-        --locked -- --nocapture
+if [ "${MINIDOX_LIMA_GUEST_DAX:-0}" = 1 ]; then
+    limactl shell --workdir="$guest_work" "$instance" -- \
+        env CARGO_TARGET_DIR="$guest_target" \
+            MINIDOX_TEST_KERNEL="$kernel" \
+            MINIDOX_TEST_INITRAMFS="$guest_initramfs" \
+            MINIDOX_TEST_CONSOLE="$guest_console" \
+            MINIDOX_TEST_VIRTIOFS=1 \
+            cargo test -p minidox-vmm --test cloud_hypervisor_fork_state \
+            --locked -- --nocapture
+else
+    limactl shell --workdir="$guest_work" "$instance" -- \
+        env CARGO_TARGET_DIR="$guest_target" \
+            MINIDOX_TEST_KERNEL="$kernel" \
+            MINIDOX_TEST_INITRAMFS="$guest_initramfs" \
+            MINIDOX_TEST_CONSOLE="$guest_console" \
+            cargo test -p minidox-vmm --test cloud_hypervisor_fork_state \
+            --locked -- --nocapture
+fi

@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 static const char expected[] = "before fork";
+static const char cold_fault_command[] = "cold fault";
 
 int main(void) {
     long page_size = sysconf(_SC_PAGESIZE);
@@ -110,5 +111,20 @@ int main(void) {
     dprintf(STDOUT_FILENO, "MINIDOX_VIRTIOFS_MULTIPROCESS_OK\n");
 
     dprintf(STDOUT_FILENO, "MINIDOX_VIRTIOFS_DAX_OK\n");
+
+    while (memcmp((const char *)ram_page + 64, cold_fault_command,
+                  sizeof(cold_fault_command) - 1) != 0) {
+        usleep(1000);
+    }
+    int cold_fd = open("/mnt/cold", O_RDONLY | O_CLOEXEC);
+    void *cold_mapping = cold_fd < 0
+        ? MAP_FAILED
+        : mmap(NULL, 4096, PROT_READ, MAP_SHARED, cold_fd, 0);
+    if (cold_mapping == MAP_FAILED || *(volatile unsigned char *)cold_mapping != 0) {
+        dprintf(STDOUT_FILENO, "MINIDOX_VIRTIOFS_COLD_FAULT_ERROR errno=%d\n",
+                errno);
+        for (;;) pause();
+    }
+    dprintf(STDOUT_FILENO, "MINIDOX_VIRTIOFS_COLD_FAULT_OK\n");
     for (;;) pause();
 }

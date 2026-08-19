@@ -6,9 +6,121 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use redoxfs::{BLOCK_SIZE, Disk, FileSystem, Node, TreePtr};
 use syscall::error::{EIO, Error, Result as SyscallResult};
 
-use minidox_cache::{ForkableNodeStore, NodeId, NodeStore};
+use minidox_cache::{ForkableNodeStore, NodeId, NodeStore, PAGE_SIZE};
 
 static NEXT_BLOCK_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_FILE_OBJECT_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_PAGE_VERSION: AtomicU64 = AtomicU64::new(1);
+
+type PageKey = (NodeId, u64);
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RedoxPageIdentity(u64, u64, u64);
+
+#[derive(Debug, Default)]
+struct IdentityGeneration {
+    parent: Option<Arc<IdentityGeneration>>,
+    files: BTreeMap<NodeId, u64>,
+    pages: BTreeMap<PageKey, u64>,
+}
+
+impl IdentityGeneration {
+    fn file(&self, node: NodeId) -> Option<u64> {
+        self.files
+            .get(&node)
+            .copied()
+            .or_else(|| self.parent.as_deref().and_then(|parent| parent.file(node)))
+    }
+
+    fn page_version(&self, key: &PageKey) -> Option<u64> {
+        self.pages.get(key).copied().or_else(|| {
+            self.parent
+                .as_deref()
+                .and_then(|parent| parent.page_version(key))
+        })
+    }
+}
+
+#[derive(Debug)]
+struct IdentityBranch {
+    base: Arc<IdentityGeneration>,
+    files: BTreeMap<NodeId, u64>,
+    pages: BTreeMap<PageKey, u64>,
+}
+
+impl IdentityBranch {
+    fn new() -> Self {
+        Self {
+            base: Arc::new(IdentityGeneration::default()),
+            files: BTreeMap::new(),
+            pages: BTreeMap::new(),
+        }
+    }
+
+    fn fork(&mut self) -> Self {
+        if !self.files.is_empty() || !self.pages.is_empty() {
+            self.base = Arc::new(IdentityGeneration {
+                parent: Some(Arc::clone(&self.base)),
+                files: std::mem::take(&mut self.files),
+                pages: std::mem::take(&mut self.pages),
+            });
+        }
+        Self {
+            base: Arc::clone(&self.base),
+            files: BTreeMap::new(),
+            pages: BTreeMap::new(),
+        }
+    }
+
+    fn create_file(&mut self, node: NodeId) {
+        self.files
+            .insert(node, NEXT_FILE_OBJECT_ID.fetch_add(1, Ordering::Relaxed));
+    }
+
+    fn page_identity(&self, node: NodeId, offset: u64) -> io::Result<RedoxPageIdentity> {
+        let object = self
+            .files
+            .get(&node)
+            .copied()
+            .or_else(|| self.base.file(node))
+            .ok_or_else(|| io::Error::from_raw_os_error(EIO))?;
+        let page = offset / PAGE_SIZE;
+        let version = self
+            .pages
+            .get(&(node, page))
+            .copied()
+            .or_else(|| self.base.page_version(&(node, page)))
+            .unwrap_or(0);
+        Ok(RedoxPageIdentity(object, page, version))
+    }
+
+    fn record_write(&mut self, node: NodeId, offset: u64, len: usize) -> io::Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(len as u64)
+            .ok_or_else(|| io::Error::from_raw_os_error(EIO))?;
+        let first = offset / PAGE_SIZE;
+        let last = (end - 1) / PAGE_SIZE;
+        for page in first..=last {
+            self.pages.insert(
+                (node, page),
+                NEXT_PAGE_VERSION.fetch_add(1, Ordering::Relaxed),
+            );
+        }
+        Ok(())
+    }
+
+    fn prepare_page_write(&mut self, node: NodeId, offset: u64) -> io::Result<RedoxPageIdentity> {
+        let page = offset / PAGE_SIZE;
+        self.pages.insert(
+            (node, page),
+            NEXT_PAGE_VERSION.fetch_add(1, Ordering::Relaxed),
+        );
+        self.page_identity(node, offset)
+    }
+}
 
 #[derive(Debug)]
 struct Block {
@@ -172,23 +284,29 @@ pub struct DirectoryEntry {
 /// An independently writable RedoxFS branch over shared immutable disk blocks.
 pub struct RedoxBranch {
     fs: FileSystem<CowDisk>,
+    identities: IdentityBranch,
 }
 
 impl RedoxBranch {
     pub fn create(size: u64) -> io::Result<Self> {
         let fs = FileSystem::create(CowDisk::new(size), None, 1, 0).map_err(io_error)?;
-        Ok(Self { fs })
+        let mut identities = IdentityBranch::new();
+        identities.create_file(TreePtr::<Node>::root().id());
+        Ok(Self { fs, identities })
     }
 
     pub fn create_file(&mut self, name: &str, size: u64) -> io::Result<NodeId> {
-        self.fs
+        let node = self
+            .fs
             .tx(|tx| {
                 let node =
                     tx.create_node(TreePtr::<Node>::root(), name, Node::MODE_FILE | 0o644, 1, 0)?;
                 tx.truncate_node(node.ptr(), size, 1, 0)?;
                 Ok(node.ptr().id())
             })
-            .map_err(io_error)
+            .map_err(io_error)?;
+        self.identities.create_file(node);
+        Ok(node)
     }
 
     pub fn read(&mut self, node: NodeId, offset: u64, len: usize) -> io::Result<Vec<u8>> {
@@ -202,9 +320,12 @@ impl RedoxBranch {
     }
 
     pub fn write(&mut self, node: NodeId, offset: u64, bytes: &[u8]) -> io::Result<usize> {
-        self.fs
+        let written = self
+            .fs
             .tx(|tx| tx.write_node(TreePtr::<Node>::new(node), offset, bytes, 1, 0))
-            .map_err(io_error)
+            .map_err(io_error)?;
+        self.identities.record_write(node, offset, written)?;
+        Ok(written)
     }
 
     pub fn metadata(&mut self, node: NodeId) -> io::Result<NodeMetadata> {
@@ -257,9 +378,13 @@ impl RedoxBranch {
 
     pub fn fork(&mut self) -> io::Result<Self> {
         let child_disk = self.fs.disk.fork();
+        let child_identities = self.identities.fork();
         let child =
             FileSystem::open(child_disk, None, Some(self.fs.block), false).map_err(io_error)?;
-        Ok(Self { fs: child })
+        Ok(Self {
+            fs: child,
+            identities: child_identities,
+        })
     }
 
     pub fn block_accounting<'a>(branches: impl IntoIterator<Item = &'a Self>) -> BlockAccounting {
@@ -320,6 +445,16 @@ impl NodeStore for RedoxBranch {
 }
 
 impl ForkableNodeStore for RedoxBranch {
+    type PageIdentity = RedoxPageIdentity;
+
+    fn page_identity(&mut self, node: NodeId, offset: u64) -> io::Result<Self::PageIdentity> {
+        self.identities.page_identity(node, offset)
+    }
+
+    fn prepare_page_write(&mut self, node: NodeId, offset: u64) -> io::Result<Self::PageIdentity> {
+        self.identities.prepare_page_write(node, offset)
+    }
+
     fn fork_store(&mut self) -> io::Result<Self> {
         self.fork()
     }

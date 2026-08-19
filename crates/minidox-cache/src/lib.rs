@@ -15,7 +15,9 @@ use std::sync::Arc;
 
 mod branching;
 
-pub use branching::{BranchingPageCache, CachePageAccounting, DaxPageMapping, ForkableNodeStore};
+pub use branching::{
+    CacheBranchId, CachePageAccounting, DaxPageMapping, ForkableNodeStore, SharedPageCache,
+};
 
 pub const PAGE_SIZE: u64 = 4096;
 pub type NodeId = u32;
@@ -49,6 +51,7 @@ pub enum CacheError {
     Io(io::Error),
     InvalidMapping(&'static str),
     NodeNotOpen(NodeId),
+    BranchNotFound(u64),
     StaleMapping,
     ActiveMappings,
     PageBusy,
@@ -60,6 +63,7 @@ impl fmt::Display for CacheError {
             Self::Io(err) => err.fmt(f),
             Self::InvalidMapping(message) => f.write_str(message),
             Self::NodeNotOpen(node) => write!(f, "node {node} is not open"),
+            Self::BranchNotFound(branch) => write!(f, "cache branch {branch} does not exist"),
             Self::StaleMapping => f.write_str("mapping no longer belongs to this cache"),
             Self::ActiveMappings => f.write_str("cache still has active DAX mappings"),
             Self::PageBusy => f.write_str("DAX page must be unmapped before copy-on-write"),

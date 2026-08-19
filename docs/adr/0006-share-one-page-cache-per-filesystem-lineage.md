@@ -1,0 +1,3 @@
+# Share one page cache per filesystem lineage
+
+One Supervisor-owned page cache serves every Filesystem Branch in a Filesystem Lineage, while each VM receives only a Branch Capability and its own DAX mappings. Cache entries are selected by the branch-visible identity of a File Object page, so unchanged forks cold-fault the same entry and a write creates a new identity only for the written branch and page. This deliberately rejects both per-VM caches and per-branch caches backed by a deduplicating pool: those models duplicate cache metadata and do not behave like processes sharing an operating system page cache.

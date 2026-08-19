@@ -68,6 +68,9 @@ fn supervisor_forks_running_vm_ram_redoxfs_and_machine_state() {
             Duration::from_secs(180),
         );
     }
+    let _cold = supervisor
+        .create_file(source, "cold", RAM_PAGE_SIZE as u64)
+        .unwrap();
     assert_eq!(
         supervisor.read_memory(source, memory_offset, 11).unwrap(),
         b"before fork"
@@ -84,6 +87,16 @@ fn supervisor_forks_running_vm_ram_redoxfs_and_machine_state() {
     assert_eq!(shared.memory.shared_pages, RAM_SIZE / RAM_PAGE_SIZE);
     assert_eq!(shared.filesystem.resident_pages, 1);
     assert_eq!(shared.filesystem.shared_pages, 1);
+
+    if env::var_os("MINIDOX_TEST_VIRTIOFS").is_some() {
+        supervisor
+            .write_memory(source, memory_offset + 64, b"cold fault")
+            .unwrap();
+        supervisor
+            .write_memory(child, memory_offset + 64, b"cold fault")
+            .unwrap();
+        wait_for_shared_filesystem_pages(&supervisor, 2, 2, Duration::from_secs(180));
+    }
 
     supervisor
         .write_memory(source, memory_offset, b"after fork!")
@@ -118,6 +131,26 @@ fn supervisor_forks_running_vm_ram_redoxfs_and_machine_state() {
     fs::remove_file(console).unwrap();
 }
 
+fn wait_for_shared_filesystem_pages(
+    supervisor: &KvmSupervisor,
+    resident_pages: usize,
+    shared_pages: usize,
+    timeout: Duration,
+) {
+    let started = std::time::Instant::now();
+    while started.elapsed() < timeout {
+        let filesystem = supervisor.page_accounting().filesystem;
+        if filesystem.resident_pages == resident_pages && filesystem.shared_pages == shared_pages {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let filesystem = supervisor.page_accounting().filesystem;
+    panic!(
+        "filesystem cache did not reach {resident_pages} resident and {shared_pages} shared pages within {timeout:?}; observed {filesystem:?}"
+    );
+}
+
 fn wait_for_console(path: &PathBuf, marker: &str, timeout: Duration) {
     let started = std::time::Instant::now();
     while started.elapsed() < timeout {
@@ -133,7 +166,12 @@ fn wait_for_console(path: &PathBuf, marker: &str, timeout: Duration) {
         }
         thread::sleep(Duration::from_millis(50));
     }
-    panic!("guest console did not contain {marker:?} within {timeout:?}");
+    let contents = fs::read_to_string(path).unwrap_or_default();
+    let tail = contents.lines().rev().take(80).collect::<Vec<_>>();
+    panic!(
+        "guest console did not contain {marker:?} within {timeout:?}; console tail:\n{}",
+        tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+    );
 }
 
 fn wait_for_guest_ram_gpa(path: &PathBuf, timeout: Duration) -> u64 {

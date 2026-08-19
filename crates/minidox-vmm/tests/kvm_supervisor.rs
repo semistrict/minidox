@@ -16,6 +16,9 @@ fn one_kvm_supervisor_fork_publishes_ram_redoxfs_and_dax() {
     let state = supervisor
         .create_file(source, "state", RAM_PAGE_SIZE as u64)
         .unwrap();
+    let cold = supervisor
+        .create_file(source, "cold", RAM_PAGE_SIZE as u64)
+        .unwrap();
     supervisor
         .write_memory(source, 128, b"before fork")
         .unwrap();
@@ -29,6 +32,20 @@ fn one_kvm_supervisor_fork_publishes_ram_redoxfs_and_dax() {
     assert_eq!(shared.memory.shared_pages, 3);
     assert_eq!(shared.filesystem.resident_pages, 1);
     assert_eq!(shared.filesystem.shared_pages, 1);
+
+    assert_eq!(
+        supervisor
+            .read_file(source, cold, 0, RAM_PAGE_SIZE)
+            .unwrap(),
+        vec![0; RAM_PAGE_SIZE]
+    );
+    assert_eq!(
+        supervisor.read_file(child, cold, 0, RAM_PAGE_SIZE).unwrap(),
+        vec![0; RAM_PAGE_SIZE]
+    );
+    let cold_shared = supervisor.page_accounting().filesystem;
+    assert_eq!(cold_shared.resident_pages, 2);
+    assert_eq!(cold_shared.shared_pages, 2);
 
     supervisor
         .write_memory(source, 128, b"after fork!")
