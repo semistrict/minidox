@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/minidox-cache",
+    "crates/minidox-fork",
     "crates/minidox-redoxfs",
     "crates/minidox-vmm",
 ]
