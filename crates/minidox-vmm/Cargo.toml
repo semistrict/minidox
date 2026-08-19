@@ -11,6 +11,8 @@ thiserror.workspace = true
 cloud-hypervisor = { package = "vmm", path = "../../vendor/cloud-hypervisor/vmm", features = ["kvm"] }
 cloud-hypervisor-hypervisor = { package = "hypervisor", path = "../../vendor/cloud-hypervisor/hypervisor", features = ["kvm"] }
 libc.workspace = true
+minidox-cache.workspace = true
+minidox-redoxfs = { path = "../minidox-redoxfs" }
 seccompiler = "0.5.0"
 tempfile.workspace = true
 vmm-sys-util = "0.15.0"

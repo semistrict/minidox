@@ -8,11 +8,15 @@
 mod linux;
 #[cfg(target_os = "linux")]
 mod ram;
+#[cfg(target_os = "linux")]
+mod supervisor;
 
 #[cfg(target_os = "linux")]
 pub use linux::{CloudHypervisorVm, VmConfig};
 #[cfg(target_os = "linux")]
 pub use ram::{KvmGuestRam, RAM_PAGE_SIZE, RamAccounting};
+#[cfg(target_os = "linux")]
+pub use supervisor::{KvmForkAccounting, KvmSupervisor, KvmVmId, SupervisorError};
 
 /// Whether this build can instantiate the KVM-backed VMM.
 pub const fn is_supported_host() -> bool {
