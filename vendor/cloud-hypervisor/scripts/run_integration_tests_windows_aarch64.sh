@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2048,SC2086
+set -x
+
+# shellcheck source=/dev/null
+source "$HOME"/.cargo/env
+source "$(dirname "$0")"/test-util.sh
+source "$(dirname "$0")"/common-aarch64.sh
+
+process_common_args "$@"
+
+# aarch64 not supported for MSHV
+if [[ "$hypervisor" = "mshv" ]]; then
+    echo "AArch64 is not supported in Microsoft Hypervisor"
+    exit 1
+fi
+
+WIN_IMAGE_BASENAME="windows-11-iot-enterprise-aarch64.raw"
+WIN_IMAGE_FILE="$WORKLOADS_DIR/$WIN_IMAGE_BASENAME"
+
+OVMF_FW="$WORKLOADS_DIR/CLOUDHV_EFI.fd"
+if [ ! -f "$OVMF_FW" ]; then
+    echo "Missing workload asset: $OVMF_FW"
+    echo "Run: python3 scripts/fetch_workloads.py --test windows"
+    exit 1
+fi
+
+# Check if the images are present
+if [[ ! -f ${WIN_IMAGE_FILE} || ! -f ${OVMF_FW} ]]; then
+    echo "Windows image/firmware not present in the host"
+    exit 1
+fi
+
+# Remove every device-mapper device this Windows test suite may have created
+# (the base plus any per-test snapshot a crashed or timed-out test left
+# behind). Snapshots reference the base as their origin and must be removed
+# first, so retry a few times to tolerate ordering. Only 'windows-*' devices
+# are touched, never any other device-mapper device on the host.
+cleanup_windows_dm() {
+    for _ in 1 2 3; do
+        local devs
+        devs=$(dmsetup ls 2>/dev/null | awk '{print $1}' | grep '^windows-' || true)
+        [ -z "$devs" ] && break
+        for dev in $devs; do
+            dmsetup remove "$dev" 2>/dev/null || true
+        done
+    done
+}
+
+# Clear anything a previous crashed or killed run left behind so the dmsetup
+# create below does not fail on a stale device, then detach any stale loop
+# devices still backing the image.
+cleanup_windows_dm
+losetup -j "${WIN_IMAGE_FILE}" | cut -d : -f 1 | while read -r stale; do
+    losetup -d "$stale" 2>/dev/null || true
+done
+
+# Use device mapper to create a snapshot of the Windows image
+img_blk_size=$(du -b -B 512 "${WIN_IMAGE_FILE}" | awk '{print $1;}')
+loop_device=$(losetup --find --show --read-only "${WIN_IMAGE_FILE}")
+dmsetup create windows-base --table "0 $img_blk_size linear $loop_device 0"
+dmsetup mknodes
+
+# Common configuration for every test run
+export RUST_BACKTRACE=1
+export RUSTFLAGS="$RUSTFLAGS"
+
+cargo build --all --release --target "$BUILD_TARGET"
+
+time cargo nextest run -p cloud-hypervisor --profile windows --no-tests=pass "windows::$test_filter" --target "$BUILD_TARGET" -- ${test_binary_args[*]}
+RES=$?
+
+# Tear down the base and any per-test snapshot devices left over from a crash,
+# then detach this run's loop device.
+cleanup_windows_dm
+losetup -d "$loop_device" 2>/dev/null || true
+
+exit $RES

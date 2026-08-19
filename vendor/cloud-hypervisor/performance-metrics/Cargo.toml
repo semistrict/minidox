@@ -1,0 +1,19 @@
+[package]
+authors = ["The Cloud Hypervisor Authors"]
+edition.workspace = true
+name = "performance-metrics"
+version = "0.1.0"
+
+[dependencies]
+block = { path = "../block", features = ["io_uring", "test-utils"] }
+clap = { workspace = true, features = ["wrap_help"] }
+libc = { workspace = true }
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_json = { workspace = true }
+test_infra = { path = "../test_infra" }
+thiserror = { workspace = true }
+vm-memory = { workspace = true, features = ["backend-mmap"] }
+vmm-sys-util = { workspace = true }
+
+[lints]
+workspace = true

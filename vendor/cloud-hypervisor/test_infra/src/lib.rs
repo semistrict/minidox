@@ -1,0 +1,2853 @@
+// Copyright © 2021 Intel Corporation
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+#![expect(clippy::undocumented_unsafe_blocks)]
+
+use std::any::Any;
+use std::collections::HashMap;
+use std::ffi::{CString, OsStr};
+use std::fmt::{Display, Formatter};
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::str::FromStr;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+use std::{env, fmt, fs, io, mem, num, panic, thread};
+
+use rand::Rng;
+use serde_json::Value;
+use ssh2::Session;
+use thiserror::Error;
+use vmm_sys_util::tempdir::TempDir;
+use wait_timeout::ChildExt;
+
+// ---------------------------------------------------------------------------
+// Process group registry, one group per test.
+//
+// Every child process spawned during a test is placed into a shared
+// process group.  The first child creates the group via setpgid(0, 0)
+// and subsequent children join via setpgid(0, pgid).  A single
+// killpg(pgid, SIGKILL) tears down all processes when the test ends.
+//
+// The registry maps test name to the group PID, protected by a mutex
+// so that concurrent tests each get their own independent group.
+//
+// Any Command::spawn() in test helpers should go through
+// ProcessRegistry::spawn so the child is automatically tracked.
+// ---------------------------------------------------------------------------
+
+static PROCESS_REGISTRY: LazyLock<Mutex<HashMap<String, u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const GROUP_REAP_TIMEOUT_SECS: u64 = 5;
+
+#[derive(Error, Debug)]
+pub enum CleanupError {
+    #[error("Process group {pgid} for test '{test}' survived cleanup")]
+    Lingered { pgid: u32, test: String },
+}
+
+pub struct ProcessRegistry;
+
+impl ProcessRegistry {
+    /// Spawn `cmd` in the process group for `test_name`.
+    ///
+    /// The first spawn creates a new group (group PID = child PID).
+    /// Subsequent spawns join the existing group.
+    pub fn spawn(test_name: &str, cmd: &mut Command) -> io::Result<Child> {
+        let pgid = {
+            let mut reg = PROCESS_REGISTRY.lock().unwrap();
+            let stored = reg.get(test_name).copied();
+            // If the stored group no longer has any live processes,
+            // discard it so the next child creates a fresh group.
+            if let Some(id) = stored {
+                let probe = unsafe { libc::killpg(id as i32, 0) };
+                if probe == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                    reg.remove(test_name);
+                    None
+                } else {
+                    stored
+                }
+            } else {
+                None
+            }
+        };
+
+        unsafe {
+            cmd.pre_exec(move || {
+                let target = pgid.unwrap_or(0) as libc::pid_t;
+                // Best effort: may fail with EPERM in containers.
+                let _ = libc::setpgid(0, target);
+                Ok(())
+            });
+        }
+
+        let child = cmd.spawn()?;
+
+        if pgid.is_none() {
+            let actual = unsafe { libc::getpgid(child.id() as i32) };
+            if actual == child.id() as i32 {
+                PROCESS_REGISTRY
+                    .lock()
+                    .unwrap()
+                    .insert(test_name.to_string(), child.id());
+            }
+        }
+
+        Ok(child)
+    }
+
+    /// Kill all processes in the group for `test_name`, remove the entry,
+    /// and wait for the group to exit. Errors if the group survives.
+    pub fn cleanup(test_name: &str) -> Result<(), CleanupError> {
+        let Some(pgid) = PROCESS_REGISTRY.lock().unwrap().remove(test_name) else {
+            return Ok(());
+        };
+
+        let ret = unsafe { libc::killpg(pgid as i32, libc::SIGKILL) };
+        if ret != 0 {
+            // ESRCH: all processes already exited.
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            eprintln!(
+                "[cleanup] Failed to kill process group {pgid} \
+                 (test '{test_name}'): {err}"
+            );
+            return Err(CleanupError::Lingered {
+                pgid,
+                test: test_name.to_string(),
+            });
+        }
+
+        eprintln!("[cleanup] Sent SIGKILL to process group {pgid} (test '{test_name}')");
+        // SIGKILL is async, so wait for the group to actually exit.
+        if Self::reap_group(pgid) {
+            Ok(())
+        } else {
+            Err(CleanupError::Lingered {
+                pgid,
+                test: test_name.to_string(),
+            })
+        }
+    }
+
+    /// Wait for the process group `pgid` to exit, up to a short timeout.
+    /// Returns true if it drained.
+    fn reap_group(pgid: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(GROUP_REAP_TIMEOUT_SECS);
+        loop {
+            let mut status = 0;
+            let r = unsafe { libc::waitpid(-(pgid as i32), &mut status, libc::WNOHANG) };
+            if r > 0 {
+                continue;
+            }
+            if r == -1 {
+                // ECHILD: nothing left in the group to reap.
+                return io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum WaitTimeoutError {
+    #[error("timeout")]
+    Timedout,
+    #[error("exit status indicates failure")]
+    ExitStatus,
+    #[error("general failure")]
+    General(#[source] io::Error),
+}
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("Failed to parse")]
+    Parsing(#[source] num::ParseIntError),
+    #[error("ssh command failed")]
+    SshCommand(#[from] SshCommandError),
+    #[error("waiting for boot failed")]
+    WaitForBoot(#[source] WaitForBootError),
+    #[error("reading log file failed")]
+    EthrLogFile(#[source] io::Error),
+    #[error("parsing log file failed")]
+    EthrLogParse,
+    #[error("parsing fio output failed")]
+    FioOutputParse,
+    #[error("parsing iperf3 output failed")]
+    Iperf3Parse,
+    #[error("spawning process failed")]
+    Spawn(#[source] io::Error),
+    #[error("waiting for timeout failed")]
+    WaitTimeout(#[source] WaitTimeoutError),
+}
+
+/// Polls a boolean condition until it becomes true or the timeout expires.
+pub fn wait_until<F>(timeout: Duration, mut condition: F) -> bool
+where
+    F: FnMut() -> bool,
+{
+    const INTERVAL: Duration = Duration::from_millis(50);
+    let start = Instant::now();
+
+    loop {
+        if condition() {
+            return true;
+        }
+
+        if start.elapsed() >= timeout {
+            return false;
+        }
+
+        thread::sleep(INTERVAL);
+    }
+}
+
+/// Retries an operation until it returns `Ok` or the timeout expires.
+pub fn wait_until_succeeds<F, T, E>(timeout: Duration, mut operation: F) -> Result<T, E>
+where
+    F: FnMut() -> Result<T, E>,
+{
+    const INTERVAL: Duration = Duration::from_millis(50);
+    let start = Instant::now();
+
+    loop {
+        match operation() {
+            Ok(result) => return Ok(result),
+            Err(err) if start.elapsed() >= timeout => return Err(err),
+            Err(_) => thread::sleep(INTERVAL),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct GuestNetworkConfig {
+    pub guest_ip0: String,
+    pub host_ip0: String,
+    pub guest_mac0: String,
+    pub guest_ip1: String,
+    pub host_ip1: String,
+    pub guest_mac1: String,
+    pub l2_guest_ip1: String,
+    pub l2_guest_ip2: String,
+    pub l2_guest_ip3: String,
+    pub l2_guest_mac1: String,
+    pub l2_guest_mac2: String,
+    pub l2_guest_mac3: String,
+    pub tcp_listener_port: u16,
+    pub l2_tcp_listener_port: u16,
+    pub notify_ip: String,
+}
+
+pub const DEFAULT_TCP_LISTENER_MESSAGE: &str = "booted";
+pub const DEFAULT_TCP_LISTENER_PORT: u16 = 8000;
+pub const DEFAULT_TCP_LISTENER_TIMEOUT: u32 = 120;
+pub const DEFAULT_CVM_TCP_LISTENER_TIMEOUT: u32 = 140;
+
+#[derive(Error, Debug)]
+pub enum WaitForBootError {
+    #[error("Failed to wait for epoll")]
+    EpollWait(#[source] io::Error),
+    #[error("Failed to listen for boot")]
+    Listen(#[source] io::Error),
+    #[error("Epoll wait timeout")]
+    EpollWaitTimeout,
+    #[error("wrong guest address")]
+    WrongGuestAddr,
+    #[error("Failed to accept a TCP request")]
+    Accept(#[source] io::Error),
+}
+
+impl GuestNetworkConfig {
+    pub fn wait_vm_boot_from(
+        port: u16,
+        expected_guest_addr: &str,
+        custom_timeout: u32,
+    ) -> Result<(), WaitForBootError> {
+        let start = Instant::now();
+        let listen_addr = format!("0.0.0.0:{port}");
+        let mut s = String::new();
+
+        let mut closure = || -> Result<(), WaitForBootError> {
+            let listener =
+                TcpListener::bind(listen_addr.as_str()).map_err(WaitForBootError::Listen)?;
+            listener
+                .set_nonblocking(true)
+                .expect("Cannot set non-blocking for tcp listener");
+
+            // Reply on epoll w/ timeout to wait for guest connections faithfully
+            let epoll_fd = epoll::create(true).expect("Cannot create epoll fd");
+            // Use 'File' to enforce closing on 'epoll_fd'
+            let _epoll_file = unsafe { fs::File::from_raw_fd(epoll_fd) };
+            epoll::ctl(
+                epoll_fd,
+                epoll::ControlOptions::EPOLL_CTL_ADD,
+                listener.as_raw_fd(),
+                epoll::Event::new(epoll::Events::EPOLLIN, 0),
+            )
+            .expect("Cannot add 'tcp_listener' event to epoll");
+            let mut events = [epoll::Event::new(epoll::Events::empty(), 0); 1];
+            loop {
+                let num_events = match epoll::wait(
+                    epoll_fd,
+                    (custom_timeout * 1000).try_into().unwrap(),
+                    &mut events[..],
+                ) {
+                    Ok(num_events) => Ok(num_events),
+                    Err(e) => match e.raw_os_error() {
+                        Some(libc::EAGAIN) | Some(libc::EINTR) => continue,
+                        _ => Err(e),
+                    },
+                }
+                .map_err(WaitForBootError::EpollWait)?;
+                if num_events == 0 {
+                    return Err(WaitForBootError::EpollWaitTimeout);
+                }
+                break;
+            }
+
+            match listener.accept() {
+                Ok((_, addr)) => {
+                    // Make sure the connection is from the expected 'guest_addr'
+                    if addr.ip() != IpAddr::from_str(expected_guest_addr).unwrap() {
+                        s = format!(
+                            "Expecting the guest ip '{}' while being connected with ip '{}'",
+                            expected_guest_addr,
+                            addr.ip()
+                        );
+                        return Err(WaitForBootError::WrongGuestAddr);
+                    }
+
+                    Ok(())
+                }
+                Err(e) => {
+                    s = "TcpListener::accept() failed".to_string();
+                    Err(WaitForBootError::Accept(e))
+                }
+            }
+        };
+
+        match closure() {
+            Err(e) => {
+                let duration = start.elapsed();
+                eprintln!(
+                    "\n\n==== Start 'wait_vm_boot' (FAILED) ==== \
+                    \n\nduration =\"{duration:?}, timeout = {custom_timeout}s\" \
+                    \nlisten_addr=\"{listen_addr}\" \
+                    \nexpected_guest_addr=\"{expected_guest_addr}\" \
+                    \nmessage=\"{s}\" \
+                    \nerror=\"{e:?}\" \
+                    \n\n==== End 'wait_vm_boot' outout ====\n\n"
+                );
+
+                Err(e)
+            }
+            Ok(_) => Ok(()),
+        }
+    }
+
+    pub fn wait_vm_boot(&self, custom_timeout: u32) -> Result<(), WaitForBootError> {
+        Self::wait_vm_boot_from(self.tcp_listener_port, &self.guest_ip0, custom_timeout)
+    }
+}
+
+pub enum DiskType {
+    OperatingSystem,
+    CloudInit,
+}
+
+pub trait DiskConfig {
+    fn prepare_files(&mut self, tmp_dir: &TempDir, network: &GuestNetworkConfig);
+    fn prepare_cloudinit(&self, tmp_dir: &TempDir, network: &GuestNetworkConfig) -> String;
+    fn disk(&self, disk_type: DiskType) -> Option<String>;
+    fn qcow2_disk(&self) -> Option<String> {
+        None
+    }
+}
+
+#[derive(Clone)]
+pub struct UbuntuDiskConfig {
+    osdisk_path: String,
+    cloudinit_path: String,
+    image_name: String,
+}
+
+impl UbuntuDiskConfig {
+    pub fn new(image_name: String) -> Self {
+        UbuntuDiskConfig {
+            image_name,
+            osdisk_path: String::new(),
+            cloudinit_path: String::new(),
+        }
+    }
+}
+
+pub struct WindowsDiskConfig {
+    image_name: String,
+    osdisk_path: String,
+    osdisk_qcow2_path: String,
+    loopback_device: String,
+    windows_snapshot_cow: String,
+    windows_snapshot: String,
+}
+
+impl WindowsDiskConfig {
+    pub fn new(image_name: String) -> Self {
+        WindowsDiskConfig {
+            image_name,
+            osdisk_path: String::new(),
+            osdisk_qcow2_path: String::new(),
+            loopback_device: String::new(),
+            windows_snapshot_cow: String::new(),
+            windows_snapshot: String::new(),
+        }
+    }
+}
+
+impl Drop for WindowsDiskConfig {
+    fn drop(&mut self) {
+        // dmsetup remove windows-snapshot-1
+        Command::new("dmsetup")
+            .arg("remove")
+            .arg(self.windows_snapshot.as_str())
+            .output()
+            .expect("Expect removing Windows snapshot with 'dmsetup' to succeed");
+
+        // dmsetup remove windows-snapshot-cow-1
+        Command::new("dmsetup")
+            .arg("remove")
+            .arg(self.windows_snapshot_cow.as_str())
+            .output()
+            .expect("Expect removing Windows snapshot CoW with 'dmsetup' to succeed");
+
+        // losetup -d <loopback_device>
+        Command::new("losetup")
+            .args(["-d", self.loopback_device.as_str()])
+            .output()
+            .expect("Expect removing loopback device to succeed");
+
+        if !self.osdisk_qcow2_path.is_empty() {
+            let _ = fs::remove_file(&self.osdisk_qcow2_path);
+        }
+    }
+}
+
+/// Returns the workspace root directory.
+///
+/// As we don't have packages in the workspace root,
+/// we walk up until we found the main Cargo.toml file.
+fn workspace_root() -> PathBuf {
+    // The directory of the current crate (integration test).
+    let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    // Currently we have one level of nesting and we probably never change it.
+    let max_levels = 2;
+
+    eprintln!(
+        "Looking for workspace root: starting with dir={}",
+        dir.to_str().unwrap()
+    );
+
+    // walk up
+    for _ in 0..max_levels {
+        dir = dir.parent().unwrap().to_path_buf();
+        eprintln!("Checking parent dir: {}", dir.to_str().unwrap());
+        let maybe_manifest_file = dir.join("Cargo.toml");
+        if maybe_manifest_file.exists() {
+            let content = fs::read_to_string(&maybe_manifest_file).unwrap();
+            if content.contains("[workspace]") && content.contains("Cloud Hypervisor Workspace") {
+                eprintln!("INFO: Found workspace root: {}", dir.to_str().unwrap());
+                return dir;
+            }
+        }
+    }
+
+    panic!("Could not find workspace root");
+}
+
+impl DiskConfig for UbuntuDiskConfig {
+    fn prepare_cloudinit(&self, tmp_dir: &TempDir, network: &GuestNetworkConfig) -> String {
+        let cloudinit_file_path =
+            String::from(tmp_dir.as_path().join("cloudinit").to_str().unwrap());
+
+        let cloud_init_directory = tmp_dir.as_path().join("cloud-init").join("ubuntu");
+
+        fs::create_dir_all(&cloud_init_directory)
+            .expect("Expect creating cloud-init directory to succeed");
+
+        let source_file_dir = workspace_root()
+            .join("test_data")
+            .join("cloud-init")
+            .join("ubuntu")
+            .join("ci");
+
+        ["meta-data"].iter().for_each(|x| {
+            let source_file = source_file_dir.join(x);
+            let cloud_init = cloud_init_directory.join(x);
+            rate_limited_copy(source_file, cloud_init)
+                .expect("Expect copying cloud-init meta-data to succeed");
+        });
+
+        let mut user_data_string = String::new();
+        fs::File::open(source_file_dir.join("user-data"))
+            .unwrap()
+            .read_to_string(&mut user_data_string)
+            .expect("Expected reading user-data file to succeed");
+        user_data_string = user_data_string.replace(
+            "@DEFAULT_TCP_LISTENER_MESSAGE",
+            DEFAULT_TCP_LISTENER_MESSAGE,
+        );
+        user_data_string = user_data_string.replace("@NOTIFY_IP", &network.notify_ip);
+        user_data_string =
+            user_data_string.replace("@TCP_LISTENER_PORT", &network.tcp_listener_port.to_string());
+
+        fs::File::create(cloud_init_directory.join("user-data"))
+            .unwrap()
+            .write_all(user_data_string.as_bytes())
+            .expect("Expected writing out user-data to succeed");
+
+        let mut network_config_string = String::new();
+
+        fs::File::open(source_file_dir.join("network-config"))
+            .unwrap()
+            .read_to_string(&mut network_config_string)
+            .expect("Expected reading network-config file to succeed");
+
+        network_config_string = network_config_string.replace("192.168.2.1", &network.host_ip0);
+        network_config_string = network_config_string.replace("192.168.2.2", &network.guest_ip0);
+        network_config_string = network_config_string.replace("192.168.2.129", &network.host_ip1);
+        network_config_string = network_config_string.replace("192.168.2.130", &network.guest_ip1);
+        network_config_string = network_config_string.replace("192.168.2.3", &network.l2_guest_ip1);
+        network_config_string = network_config_string.replace("192.168.2.4", &network.l2_guest_ip2);
+        network_config_string = network_config_string.replace("192.168.2.5", &network.l2_guest_ip3);
+        network_config_string =
+            network_config_string.replace("12:34:56:78:90:ab", &network.guest_mac0);
+        network_config_string =
+            network_config_string.replace("de:ad:be:ef:78:90", &network.guest_mac1);
+        network_config_string =
+            network_config_string.replace("de:ad:be:ef:12:34", &network.l2_guest_mac1);
+        network_config_string =
+            network_config_string.replace("de:ad:be:ef:34:56", &network.l2_guest_mac2);
+        network_config_string =
+            network_config_string.replace("de:ad:be:ef:56:78", &network.l2_guest_mac3);
+
+        fs::File::create(cloud_init_directory.join("network-config"))
+            .unwrap()
+            .write_all(network_config_string.as_bytes())
+            .expect("Expected writing out network-config to succeed");
+
+        Command::new("mkdosfs")
+            .args(["-n", "CIDATA"])
+            .args(["-C", cloudinit_file_path.as_str()])
+            .arg("8192")
+            .output()
+            .expect("Expect creating disk image to succeed");
+
+        ["user-data", "meta-data", "network-config"]
+            .iter()
+            .for_each(|x| {
+                Command::new("mcopy")
+                    .arg("-o")
+                    .args(["-i", cloudinit_file_path.as_str()])
+                    .args(["-s", cloud_init_directory.join(x).to_str().unwrap(), "::"])
+                    .output()
+                    .expect("Expect copying files to disk image to succeed");
+            });
+
+        cloudinit_file_path
+    }
+
+    fn prepare_files(&mut self, tmp_dir: &TempDir, network: &GuestNetworkConfig) {
+        let mut workload_path = dirs::home_dir().unwrap();
+        workload_path.push("workloads");
+
+        let mut osdisk_base_path = workload_path;
+        osdisk_base_path.push(&self.image_name);
+
+        let osdisk_path = String::from(tmp_dir.as_path().join("osdisk.img").to_str().unwrap());
+        let cloudinit_path = self.prepare_cloudinit(tmp_dir, network);
+
+        rate_limited_copy(osdisk_base_path, &osdisk_path)
+            .expect("copying of OS source disk image failed");
+
+        self.cloudinit_path = cloudinit_path;
+        self.osdisk_path = osdisk_path;
+    }
+
+    fn disk(&self, disk_type: DiskType) -> Option<String> {
+        match disk_type {
+            DiskType::OperatingSystem => Some(self.osdisk_path.clone()),
+            DiskType::CloudInit => Some(self.cloudinit_path.clone()),
+        }
+    }
+}
+
+impl DiskConfig for WindowsDiskConfig {
+    fn prepare_cloudinit(&self, _tmp_dir: &TempDir, _network: &GuestNetworkConfig) -> String {
+        String::new()
+    }
+
+    fn prepare_files(&mut self, tmp_dir: &TempDir, _network: &GuestNetworkConfig) {
+        let mut workload_path = dirs::home_dir().unwrap();
+        workload_path.push("workloads");
+
+        let mut osdisk_path = workload_path;
+        osdisk_path.push(&self.image_name);
+
+        let osdisk_blk_size = fs::metadata(&osdisk_path)
+            .expect("Expect retrieving Windows image metadata")
+            .len()
+            >> 9;
+
+        let snapshot_cow_path =
+            String::from(tmp_dir.as_path().join("snapshot_cow").to_str().unwrap());
+
+        // Create and truncate CoW file for device mapper
+        let cow_file_size: u64 = 1 << 30;
+        let cow_file_blk_size = cow_file_size >> 9;
+        let cow_file = fs::File::create(snapshot_cow_path.as_str())
+            .expect("Expect creating CoW image to succeed");
+        cow_file
+            .set_len(cow_file_size)
+            .expect("Expect truncating CoW image to succeed");
+
+        // losetup --find --show /tmp/snapshot_cow
+        let loopback_device = Command::new("losetup")
+            .arg("--find")
+            .arg("--show")
+            .arg(snapshot_cow_path.as_str())
+            .output()
+            .expect("Expect creating loopback device from snapshot CoW image to succeed");
+
+        self.loopback_device = String::from_utf8_lossy(&loopback_device.stdout)
+            .trim()
+            .to_string();
+
+        let random_extension = tmp_dir.as_path().file_name().unwrap();
+        let windows_snapshot_cow = format!(
+            "windows-snapshot-cow-{}",
+            random_extension.to_str().unwrap()
+        );
+
+        // dmsetup create windows-snapshot-cow-1 --table '0 2097152 linear /dev/loop1 0'
+        Command::new("dmsetup")
+            .arg("create")
+            .arg(windows_snapshot_cow.as_str())
+            .args([
+                "--table",
+                format!("0 {} linear {} 0", cow_file_blk_size, self.loopback_device).as_str(),
+            ])
+            .output()
+            .expect("Expect creating Windows snapshot CoW with 'dmsetup' to succeed");
+
+        let windows_snapshot = format!("windows-snapshot-{}", random_extension.to_str().unwrap());
+
+        // dmsetup mknodes
+        Command::new("dmsetup")
+            .arg("mknodes")
+            .output()
+            .expect("Expect device mapper nodes to be ready");
+
+        // dmsetup create windows-snapshot-1 --table '0 41943040 snapshot /dev/mapper/windows-base /dev/mapper/windows-snapshot-cow-1 P 8'
+        Command::new("dmsetup")
+            .arg("create")
+            .arg(windows_snapshot.as_str())
+            .args([
+                "--table",
+                format!(
+                    "0 {} snapshot /dev/mapper/windows-base /dev/mapper/{} P 8",
+                    osdisk_blk_size,
+                    windows_snapshot_cow.as_str()
+                )
+                .as_str(),
+            ])
+            .output()
+            .expect("Expect creating Windows snapshot with 'dmsetup' to succeed");
+
+        // dmsetup mknodes
+        Command::new("dmsetup")
+            .arg("mknodes")
+            .output()
+            .expect("Expect device mapper nodes to be ready");
+
+        self.osdisk_path = format!("/dev/mapper/{windows_snapshot}");
+        self.windows_snapshot_cow = windows_snapshot_cow;
+        self.windows_snapshot = windows_snapshot;
+
+        // Create a qcow2 overlay backed by the raw image.
+        let mut workload_path = dirs::home_dir().unwrap();
+        workload_path.push("workloads");
+        let qcow2_name = format!("windows-qcow2-{}.qcow2", random_extension.to_str().unwrap());
+        let qcow2_path = workload_path.join(&qcow2_name);
+        let output = Command::new("qemu-img")
+            .args([
+                "create",
+                "-f",
+                "qcow2",
+                "-b",
+                osdisk_path.to_str().unwrap(),
+                "-F",
+                "raw",
+                qcow2_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("Expect creating qcow2 overlay to succeed");
+        assert!(output.status.success(), "qemu-img create failed");
+        self.osdisk_qcow2_path = qcow2_path.to_str().unwrap().to_string();
+    }
+
+    fn disk(&self, disk_type: DiskType) -> Option<String> {
+        match disk_type {
+            DiskType::OperatingSystem => Some(self.osdisk_path.clone()),
+            DiskType::CloudInit => None,
+        }
+    }
+
+    fn qcow2_disk(&self) -> Option<String> {
+        Some(self.osdisk_qcow2_path.clone())
+    }
+}
+
+pub fn rate_limited_copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
+    for i in 0..10 {
+        let free_bytes = unsafe {
+            let mut stats = mem::MaybeUninit::zeroed();
+            let fs_name = CString::new("/tmp").unwrap();
+            libc::statvfs(fs_name.as_ptr(), stats.as_mut_ptr());
+
+            let free_blocks = stats.assume_init().f_bfree;
+            let block_size = stats.assume_init().f_bsize;
+
+            free_blocks * block_size
+        };
+
+        // Make sure there is at least 6 GiB of space
+        if free_bytes < 6 << 30 {
+            eprintln!("Not enough space on disk ({free_bytes}). Attempt {i} of 10. Sleeping.");
+            thread::sleep(Duration::new(60, 0));
+            continue;
+        }
+
+        match fs::copy(&from, &to) {
+            Err(e) => {
+                if let Some(errno) = e.raw_os_error()
+                    && errno == libc::ENOSPC
+                {
+                    eprintln!("Copy returned ENOSPC. Attempt {i} of 10. Sleeping.");
+                    thread::sleep(Duration::new(60, 0));
+                    continue;
+                }
+
+                return Err(e);
+            }
+            Ok(i) => return Ok(i),
+        }
+    }
+    Err(io::Error::last_os_error())
+}
+
+#[expect(clippy::needless_pass_by_value)]
+pub fn handle_child_output(r: Result<(), Box<dyn Any + Send>>, output: &Output) {
+    use std::os::unix::process::ExitStatusExt;
+    if r.is_ok() && output.status.success() {
+        return;
+    }
+
+    match output.status.code() {
+        None => {
+            // Don't treat child.kill() as a problem
+            if output.status.signal() == Some(9) && r.is_ok() {
+                return;
+            }
+
+            eprintln!(
+                "==== child killed by signal: {} ====",
+                output.status.signal().unwrap()
+            );
+        }
+        Some(code) => {
+            eprintln!("\n\n==== child exit code: {code} ====");
+        }
+    }
+
+    eprintln!(
+        "\n\n==== Start child stdout ====\n\n{}\n\n==== End child stdout ====",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    eprintln!(
+        "\n\n==== Start child stderr ====\n\n{}\n\n==== End child stderr ====",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    panic!("Test failed")
+}
+
+#[derive(Debug)]
+pub struct PasswordAuth {
+    pub username: String,
+    pub password: String,
+}
+
+pub const DEFAULT_SSH_RETRIES: u8 = 6;
+pub const DEFAULT_SSH_TIMEOUT: u8 = 10;
+
+#[derive(Error, Debug)]
+pub enum SshCommandError {
+    #[error("ssh connection failed")]
+    Connection(#[source] io::Error),
+    #[error("ssh handshake failed")]
+    Handshake(#[source] ssh2::Error),
+    #[error("ssh authentication failed")]
+    Authentication(#[source] ssh2::Error),
+    #[error("ssh channel session failed")]
+    ChannelSession(#[source] ssh2::Error),
+    #[error("ssh command failed")]
+    Command(#[source] ssh2::Error),
+    #[error("retrieving exit status from ssh command failed")]
+    ExitStatus(#[source] ssh2::Error),
+    #[error("the exit code indicates failure: {0}")]
+    NonZeroExitStatus(i32),
+    #[error("failed to read file")]
+    FileRead(#[source] io::Error),
+    #[error("failed to read metadata")]
+    FileMetadata(#[source] io::Error),
+    #[error("scp send failed")]
+    ScpSend(#[source] ssh2::Error),
+    #[error("scp write failed")]
+    WriteAll(#[source] io::Error),
+    #[error("scp send EOF failed")]
+    SendEof(#[source] ssh2::Error),
+    #[error("scp wait EOF failed")]
+    WaitEof(#[source] ssh2::Error),
+}
+
+#[derive(Error, Debug)]
+pub enum WaitForSshError {
+    #[error("timed out after {timeout:?} waiting for ssh command {command:?} on {ip}: {source}")]
+    Timeout {
+        command: String,
+        ip: String,
+        timeout: Duration,
+        #[source]
+        source: SshCommandError,
+    },
+}
+
+pub fn default_guest_auth() -> PasswordAuth {
+    PasswordAuth {
+        username: String::from("cloud"),
+        password: String::from("cloud123"),
+    }
+}
+
+fn scp_to_guest_with_auth(
+    path: &Path,
+    remote_path: &Path,
+    auth: &PasswordAuth,
+    ip: &str,
+    retries: u8,
+    timeout: u8,
+) -> Result<(), SshCommandError> {
+    let mut counter = 0;
+    loop {
+        let closure = || -> Result<(), SshCommandError> {
+            let tcp =
+                TcpStream::connect(format!("{ip}:22")).map_err(SshCommandError::Connection)?;
+            let mut sess = Session::new().unwrap();
+            sess.set_tcp_stream(tcp);
+            sess.handshake().map_err(SshCommandError::Handshake)?;
+
+            sess.userauth_password(&auth.username, &auth.password)
+                .map_err(SshCommandError::Authentication)?;
+            assert!(sess.authenticated());
+
+            let content = fs::read(path).map_err(SshCommandError::FileRead)?;
+            let mode = fs::metadata(path)
+                .map_err(SshCommandError::FileMetadata)?
+                .permissions()
+                .mode()
+                & 0o777;
+
+            let mut channel = sess
+                .scp_send(remote_path, mode as i32, content.len() as u64, None)
+                .map_err(SshCommandError::ScpSend)?;
+            channel
+                .write_all(&content)
+                .map_err(SshCommandError::WriteAll)?;
+            channel.send_eof().map_err(SshCommandError::SendEof)?;
+            channel.wait_eof().map_err(SshCommandError::WaitEof)?;
+
+            // Intentionally ignore these results here as their failure
+            // does not precipitate a repeat
+            let _ = channel.close();
+            let _ = channel.wait_close();
+
+            Ok(())
+        };
+
+        match closure() {
+            Ok(_) => break,
+            Err(e) => {
+                counter += 1;
+                if counter >= retries {
+                    eprintln!(
+                        "\n\n==== Start scp command output (FAILED) ====\n\n\
+                         path =\"{path:?}\"\n\
+                         remote_path =\"{remote_path:?}\"\n\
+                         auth=\"{auth:#?}\"\n\
+                         ip=\"{ip}\"\n\
+                         error=\"{e:?}\"\n\
+                         \n==== End scp command outout ====\n\n"
+                    );
+
+                    return Err(e);
+                }
+            }
+        }
+        thread::sleep(Duration::new((timeout * counter).into(), 0));
+    }
+    Ok(())
+}
+
+pub fn scp_to_guest(
+    path: &Path,
+    remote_path: &Path,
+    ip: &str,
+    retries: u8,
+    timeout: u8,
+) -> Result<(), SshCommandError> {
+    scp_to_guest_with_auth(
+        path,
+        remote_path,
+        &PasswordAuth {
+            username: String::from("cloud"),
+            password: String::from("cloud123"),
+        },
+        ip,
+        retries,
+        timeout,
+    )
+}
+
+/// Executes a command on a remote host via SSH using password authentication.
+/// Returns the stdout output on success, or an [`SshCommandError`] on any
+/// connection, authentication, or execution failure.
+pub fn ssh_command_ip_with_auth(
+    command: &str,
+    auth: &PasswordAuth,
+    ip: &str,
+    timeout: Option<Duration>,
+) -> Result<String, SshCommandError> {
+    let mut s = String::new();
+    let tcp = TcpStream::connect(format!("{ip}:22")).map_err(SshCommandError::Connection)?;
+    let mut sess = Session::new().unwrap();
+    sess.set_tcp_stream(tcp);
+    if let Some(timeout) = timeout {
+        sess.set_timeout(timeout.as_millis() as u32);
+    }
+    sess.handshake().map_err(SshCommandError::Handshake)?;
+    sess.userauth_password(&auth.username, &auth.password)
+        .map_err(SshCommandError::Authentication)?;
+    assert!(sess.authenticated());
+    let mut channel = sess
+        .channel_session()
+        .map_err(SshCommandError::ChannelSession)?;
+    channel.exec(command).map_err(SshCommandError::Command)?;
+    // Intentionally ignore these results here as their failure
+    // does not precipitate a repeat
+    let _ = channel.read_to_string(&mut s);
+    let _ = channel.close();
+    let _ = channel.wait_close();
+    let status = channel.exit_status().map_err(SshCommandError::ExitStatus)?;
+    if status != 0 {
+        Err(SshCommandError::NonZeroExitStatus(status))
+    } else {
+        Ok(s)
+    }
+}
+
+/// Executes a command on a remote host via SSH using password authentication,
+/// retrying on failure with linear backoff.
+///
+/// Delegates each attempt to [`ssh_command_ip_with_auth`]. After the
+/// *n*-th consecutive failure the function sleeps for `timeout_s * n` seconds
+/// before the next attempt. Once `retries` attempts are exhausted the command
+/// output and error are printed to stderr and the last error is returned.
+///
+/// Note that `timeout_s` is not a per-attempt deadline — individual connection
+/// and I/O operations may block for as long as the OS or SSH layer allows.
+// TODO since we have we probably want to migrate every single invocation to a
+// more graceful combination of wait_until() and ssh_command_ip_with_auth().
+pub fn ssh_command_ip_with_auth_retry(
+    command: &str,
+    auth: &PasswordAuth,
+    ip: &str,
+    retries: u8,
+    // Base unit for the inter-retry sleep duration, in seconds.
+    timeout_s: u8,
+) -> Result<String, SshCommandError> {
+    let mut counter = 0;
+    loop {
+        match ssh_command_ip_with_auth(command, auth, ip, None) {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                counter += 1;
+                if counter >= retries {
+                    eprintln!(
+                        "\n\n==== Start ssh command output (FAILED) ====\n\n\
+                         command=\"{command}\"\n\
+                         auth=\"{auth:#?}\"\n\
+                         ip=\"{ip}\"\n\
+                         error=\"{e:?}\"\n\
+                         \n==== End ssh command output ====\n\n"
+                    );
+                    return Err(e);
+                }
+            }
+        }
+        thread::sleep(Duration::new((timeout_s * counter).into(), 0));
+    }
+}
+
+/// Executes a command on a remote host via SSH using password authentication,
+/// retrying on failure with linear backoff.
+///
+/// Wrapper around [`ssh_command_ip_with_auth_retry`].
+pub fn ssh_command_ip(
+    command: &str,
+    ip: &str,
+    retries: u8,
+    timeout: u8,
+) -> Result<String, SshCommandError> {
+    ssh_command_ip_with_auth_retry(
+        command,
+        &PasswordAuth {
+            username: String::from("cloud"),
+            password: String::from("cloud123"),
+        },
+        ip,
+        retries,
+        timeout,
+    )
+}
+
+/// Waits until SSH to the guest becomes available.
+pub fn wait_for_ssh(
+    command: &str,
+    auth: &PasswordAuth,
+    ip: &str,
+    timeout: Duration,
+) -> Result<String, WaitForSshError> {
+    wait_until_succeeds(timeout, || {
+        ssh_command_ip_with_auth(command, auth, ip, Some(timeout))
+    })
+    .map_err(|source| WaitForSshError::Timeout {
+        command: command.to_string(),
+        ip: ip.to_string(),
+        timeout,
+        source,
+    })
+}
+
+pub fn exec_host_command_with_retries(command: &str, retries: u32, interval: Duration) -> bool {
+    for _ in 0..retries {
+        let s = exec_host_command_output(command).status;
+        if s.success() {
+            return true;
+        }
+        eprintln!("\n\n==== retrying in {interval:?} ===\n\n");
+        thread::sleep(interval);
+    }
+
+    false
+}
+
+pub fn exec_host_command_status(command: &str) -> ExitStatus {
+    exec_host_command_output(command).status
+}
+
+pub fn exec_host_command_output(command: &str) -> Output {
+    let output = Command::new("bash")
+        .args(["-c", command])
+        .output()
+        .unwrap_or_else(|e| panic!("Expected '{command}' to run. Error: {e:?}"));
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!(
+            "\n\n==== Start 'exec_host_command' failed ==== \
+            \n\n---stdout---\n{stdout}\n---stderr---{stderr} \
+            \n\n==== End 'exec_host_command' failed ====",
+        );
+    }
+
+    output
+}
+
+pub fn check_lines_count(input: &str, line_count: usize) -> bool {
+    if input.lines().count() == line_count {
+        true
+    } else {
+        eprintln!(
+            "\n\n==== Start 'check_lines_count' failed ==== \
+            \n\ninput = {input}\nline_count = {line_count} \
+            \n\n==== End 'check_lines_count' failed ====",
+        );
+
+        false
+    }
+}
+
+pub fn check_matched_lines_count(input: &str, keywords: &[&str], line_count: usize) -> bool {
+    let mut matches = String::new();
+    for line in input.lines() {
+        if keywords.iter().all(|k| line.contains(k)) {
+            matches += line;
+        }
+    }
+
+    if matches.lines().count() == line_count {
+        true
+    } else {
+        eprintln!(
+            "\n\n==== Start 'check_matched_lines_count' failed ==== \
+            \nkeywords = {keywords:?}, line_count = {line_count} \
+            \n\ninput = {input} matches = {matches} \
+            \n\n==== End 'check_matched_lines_count' failed ====",
+        );
+
+        false
+    }
+}
+
+pub fn kill_child(child: &mut Child) {
+    let r = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    if r != 0 {
+        let e = io::Error::last_os_error();
+        if e.raw_os_error().unwrap() == libc::ESRCH {
+            return;
+        }
+        eprintln!("Failed to kill child with SIGTERM: {e:?}");
+    }
+
+    // The timeout period elapsed without the child exiting
+    if child.wait_timeout(Duration::new(10, 0)).unwrap().is_none() {
+        let _ = child.kill();
+        let rust_flags = env::var("RUSTFLAGS").unwrap_or_default();
+        if rust_flags.contains("-Cinstrument-coverage") {
+            panic!("Wait child timeout, please check the reason.")
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct MetaEvent {
+    pub event: String,
+    pub device_id: Option<String>,
+}
+
+impl MetaEvent {
+    pub fn match_with_json_event(&self, v: &serde_json::Value) -> bool {
+        let mut matched = false;
+        if v["event"].as_str().unwrap() == self.event {
+            if let Some(device_id) = &self.device_id {
+                if v["properties"]["id"].as_str().unwrap() == device_id {
+                    matched = true;
+                }
+            } else {
+                matched = true;
+            }
+        }
+        matched
+    }
+}
+
+pub const PIPE_SIZE: i32 = 32 << 20;
+
+pub struct Guest {
+    pub tmp_dir: TempDir,
+    pub disk_config: Box<dyn DiskConfig>,
+    pub network: GuestNetworkConfig,
+    pub vm_type: GuestVmType,
+    pub boot_timeout: u32,
+    pub kernel_path: Option<String>,
+    pub kernel_cmdline: Option<String>,
+    pub console_type: Option<String>,
+    pub num_cpu: u32,
+    pub nested: bool,
+    pub mem_size_str: String,
+    /// Test name, set from the current thread name at construction.
+    pub test_name: Option<String>,
+}
+
+// Return the next id that can be used for this guest. This is stored in a
+// file in the filesystem and is protected by a filesystem lock allowing
+// multiple test processes to safely access it with the process blocking
+// until the lock is released.
+fn next_guest_id() -> u8 {
+    let mut id_file_path = dirs::home_dir().unwrap();
+    id_file_path.push("workloads");
+    id_file_path.push("id.counter");
+
+    let mut id_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .read(true)
+        .open(id_file_path)
+        .unwrap();
+
+    id_file.lock().unwrap();
+
+    // Use a string in the file for (human) readability
+    let mut buf = String::default();
+    id_file.read_to_string(&mut buf).unwrap();
+    let id = buf.trim().parse::<u8>().unwrap_or(1);
+    let next_id = u8::max(1, id.overflowing_add(1).0);
+    id_file.set_len(0).unwrap();
+    id_file.seek(SeekFrom::Start(0)).unwrap();
+    id_file.write_all(next_id.to_string().as_bytes()).unwrap();
+
+    id_file.unlock().unwrap();
+
+    id
+}
+
+// Safe to implement as we know we have no interior mutability
+impl panic::RefUnwindSafe for Guest {}
+
+impl Guest {
+    pub fn new_from_ip_range(mut disk_config: Box<dyn DiskConfig>, class: &str, id: u8) -> Self {
+        let tmp_dir = TempDir::new_with_prefix("/tmp/ch").unwrap();
+
+        let network = GuestNetworkConfig {
+            guest_ip0: format!("{class}.{id}.2"),
+            host_ip0: format!("{class}.{id}.1"),
+            guest_mac0: format!("12:34:56:78:90:{id:02x}"),
+            guest_ip1: format!("{class}.{id}.130"),
+            host_ip1: format!("{class}.{id}.129"),
+            guest_mac1: format!("de:ad:be:ef:78:{id:02x}"),
+            l2_guest_ip1: format!("{class}.{id}.3"),
+            l2_guest_ip2: format!("{class}.{id}.4"),
+            l2_guest_ip3: format!("{class}.{id}.5"),
+            l2_guest_mac1: format!("de:ad:be:ef:12:{id:02x}"),
+            l2_guest_mac2: format!("de:ad:be:ef:34:{id:02x}"),
+            l2_guest_mac3: format!("de:ad:be:ef:56:{id:02x}"),
+            tcp_listener_port: DEFAULT_TCP_LISTENER_PORT + id as u16,
+            l2_tcp_listener_port: DEFAULT_TCP_LISTENER_PORT + 1024 + id as u16,
+            notify_ip: format!("{class}.{id}.1"),
+        };
+
+        disk_config.prepare_files(&tmp_dir, &network);
+
+        Guest {
+            tmp_dir,
+            disk_config,
+            network,
+            vm_type: GuestVmType::Regular,
+            boot_timeout: DEFAULT_TCP_LISTENER_TIMEOUT,
+            kernel_path: direct_kernel_boot_path().to_str().map(String::from),
+            kernel_cmdline: Some(DIRECT_KERNEL_BOOT_CMDLINE.to_string()),
+            console_type: None,
+            num_cpu: 1u32,
+            nested: true,
+            mem_size_str: "512M".to_string(),
+            test_name: thread::current().name().map(String::from),
+        }
+    }
+
+    pub fn new(disk_config: Box<dyn DiskConfig>) -> Self {
+        Self::new_from_ip_range(disk_config, "192.168", next_guest_id())
+    }
+
+    pub fn with_cpu(mut self, count: u32) -> Self {
+        self.num_cpu = count;
+        self
+    }
+
+    pub fn with_memory(mut self, mem_size: &str) -> Self {
+        self.mem_size_str = mem_size.to_string();
+        self
+    }
+
+    pub fn with_nested(mut self, nested: bool) -> Self {
+        self.nested = nested;
+        self
+    }
+
+    pub fn with_kernel_path(mut self, kernel_path: &str) -> Self {
+        self.kernel_path = Some(kernel_path.to_string());
+        self
+    }
+
+    pub fn with_kernel(mut self, kernel: String) -> Self {
+        self.kernel_path = Some(kernel);
+        self
+    }
+
+    pub fn default_net_string(&self) -> String {
+        format!(
+            "tap=,mac={},ip={},mask=255.255.255.128",
+            self.network.guest_mac0, self.network.host_ip0
+        )
+    }
+
+    pub fn default_net_string_w_iommu(&self) -> String {
+        format!(
+            "tap=,mac={},ip={},mask=255.255.255.128,iommu=on",
+            self.network.guest_mac0, self.network.host_ip0
+        )
+    }
+
+    pub fn default_net_string_w_mtu(&self, mtu: u16) -> String {
+        format!(
+            "tap=,mac={},ip={},mask=255.255.255.128,mtu={}",
+            self.network.guest_mac0, self.network.host_ip0, mtu
+        )
+    }
+
+    pub fn ssh_command(&self, command: &str) -> Result<String, SshCommandError> {
+        ssh_command_ip(
+            command,
+            &self.network.guest_ip0,
+            DEFAULT_SSH_RETRIES,
+            DEFAULT_SSH_TIMEOUT,
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn ssh_command_l1(&self, command: &str) -> Result<String, SshCommandError> {
+        ssh_command_ip(
+            command,
+            &self.network.guest_ip0,
+            DEFAULT_SSH_RETRIES,
+            DEFAULT_SSH_TIMEOUT,
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn ssh_command_l2_1(&self, command: &str) -> Result<String, SshCommandError> {
+        ssh_command_ip(
+            command,
+            &self.network.l2_guest_ip1,
+            DEFAULT_SSH_RETRIES,
+            DEFAULT_SSH_TIMEOUT,
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn ssh_command_l2_2(&self, command: &str) -> Result<String, SshCommandError> {
+        ssh_command_ip(
+            command,
+            &self.network.l2_guest_ip2,
+            DEFAULT_SSH_RETRIES,
+            DEFAULT_SSH_TIMEOUT,
+        )
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn ssh_command_l2_3(&self, command: &str) -> Result<String, SshCommandError> {
+        ssh_command_ip(
+            command,
+            &self.network.l2_guest_ip3,
+            DEFAULT_SSH_RETRIES,
+            DEFAULT_SSH_TIMEOUT,
+        )
+    }
+
+    /// Waits until SSH to the guest becomes available using the
+    /// [default guest authentication] and the default guest IP.
+    ///
+    /// [default guest authentication]: default_guest_auth
+    pub fn wait_for_ssh(&self, timeout: Duration) -> Result<(), WaitForSshError> {
+        wait_for_ssh(
+            "true",
+            &default_guest_auth(),
+            &self.network.guest_ip0,
+            timeout,
+        )
+        .map(|_| ())
+    }
+
+    /// Waits until the provided command succeeds via SSH on the guest using the
+    /// [default guest authentication] and the default guest IP.
+    ///
+    /// [default guest authentication]: default_guest_auth
+    pub fn wait_for_ssh_command(
+        &self,
+        command: &str,
+        timeout: Duration,
+    ) -> Result<String, WaitForSshError> {
+        wait_for_ssh(
+            command,
+            &default_guest_auth(),
+            &self.network.guest_ip0,
+            timeout,
+        )
+    }
+
+    /// Waits until the guest's SSH port is no longer reachable, indicating
+    /// the guest has probably shutdown.
+    pub fn wait_for_ssh_unresponsive(&self, timeout: Duration) -> bool {
+        let addr = format!("{}:22", self.network.guest_ip0)
+            .parse::<SocketAddr>()
+            .unwrap();
+        wait_until(timeout, || {
+            TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_err()
+        })
+    }
+
+    pub fn api_create_body(&self) -> String {
+        let mut body = serde_json::json!({
+            "cpus": {
+            "boot_vcpus": self.num_cpu,
+            "max_vcpus": self.num_cpu,
+            },
+            "net": [
+            {
+                "ip": self.network.host_ip0,
+                "mask": "255.255.255.0",
+                "mac": self.network.guest_mac0,
+            }
+            ],
+            "disks": [
+            {
+                "path": self.disk_config.disk(DiskType::OperatingSystem).unwrap(),
+                "image_type": "Raw",
+            },
+            {
+                "path": self.disk_config.disk(DiskType::CloudInit).unwrap(),
+                "image_type": "Raw",
+            }
+            ]
+        });
+
+        if !self.nested {
+            body["cpus"]["nested"] = serde_json::json!(false);
+        }
+
+        if self.vm_type == GuestVmType::Confidential {
+            body["platform"] = serde_json::json!({"sev_snp": true});
+            body["payload"] = serde_json::json!({
+            "igvm": direct_igvm_boot_path(Some("hvc0"))
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "cmdline": self.kernel_cmdline.as_deref().unwrap(),
+            "host_data": generate_host_data(),
+            });
+            // On the KVM direct-kernel path the kernel is supplied separately
+            // and read by stage0 over fw_cfg (see on_kvm_sev_snp).
+            if let Some(kernel) = sev_snp_direct_kernel() {
+                body["payload"]["kernel"] = serde_json::json!(kernel.to_str().unwrap());
+                body["payload"]["fw_cfg_config"] = serde_json::json!({
+                    "initramfs": false,
+                });
+            }
+        } else {
+            body["payload"] = serde_json::json!({
+            "kernel": self.kernel_path.as_deref().unwrap(),
+            "cmdline": self.kernel_cmdline.as_deref().unwrap(),
+            });
+        }
+
+        body.to_string()
+    }
+
+    pub fn get_cpu_count(&self) -> Result<u32, Error> {
+        self.ssh_command("grep -c processor /proc/cpuinfo")?
+            .trim()
+            .parse()
+            .map_err(Error::Parsing)
+    }
+
+    pub fn get_total_memory(&self) -> Result<u32, Error> {
+        self.ssh_command("grep MemTotal /proc/meminfo | grep -o \"[0-9]*\"")?
+            .trim()
+            .parse()
+            .map_err(Error::Parsing)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn get_total_memory_l2(&self) -> Result<u32, Error> {
+        self.ssh_command_l2_1("grep MemTotal /proc/meminfo | grep -o \"[0-9]*\"")?
+            .trim()
+            .parse()
+            .map_err(Error::Parsing)
+    }
+
+    pub fn get_numa_node_memory(&self, node_id: usize) -> Result<u32, Error> {
+        self.ssh_command(
+            format!(
+                "grep MemTotal /sys/devices/system/node/node{node_id}/meminfo \
+                        | cut -d \":\" -f 2 | grep -o \"[0-9]*\""
+            )
+            .as_str(),
+        )?
+        .trim()
+        .parse()
+        .map_err(Error::Parsing)
+    }
+
+    fn default_boot_timeout(&self) -> u32 {
+        self.boot_timeout
+    }
+
+    pub fn wait_vm_boot(&self) -> Result<(), Error> {
+        self.network
+            .wait_vm_boot(self.default_boot_timeout())
+            .map_err(Error::WaitForBoot)
+    }
+
+    pub fn wait_vm_boot_custom_timeout(&self, custom_timeout: u32) -> Result<(), Error> {
+        self.network
+            .wait_vm_boot(custom_timeout)
+            .map_err(Error::WaitForBoot)
+    }
+
+    pub fn prepare_l2_cloudinit(&self) -> (TempDir, String) {
+        let l2_dir = TempDir::new_with_prefix("/tmp/ch-l2").unwrap();
+        let l2_network = GuestNetworkConfig {
+            tcp_listener_port: self.network.l2_tcp_listener_port,
+            ..self.network.clone()
+        };
+        let path = self.disk_config.prepare_cloudinit(&l2_dir, &l2_network);
+        (l2_dir, path)
+    }
+
+    pub fn check_numa_node_cpus(&self, node_id: usize, cpus: &[usize]) -> Result<(), Error> {
+        for cpu in cpus.iter() {
+            let cmd = format!("[ -d \"/sys/devices/system/node/node{node_id}/cpu{cpu}\" ]");
+            self.ssh_command(cmd.as_str())?;
+        }
+
+        Ok(())
+    }
+
+    pub fn check_numa_node_distances(
+        &self,
+        node_id: usize,
+        distances: &str,
+    ) -> Result<bool, Error> {
+        let cmd = format!("cat /sys/devices/system/node/node{node_id}/distance");
+        if self.ssh_command(cmd.as_str())?.trim() == distances {
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn check_numa_common(
+        &self,
+        mem_ref: Option<&[u32]>,
+        node_ref: Option<&[&[usize]]>,
+        distance_ref: Option<&[&str]>,
+    ) {
+        if let Some(mem_ref) = mem_ref {
+            // Check each NUMA node has been assigned the right amount of
+            // memory.
+            for (i, &m) in mem_ref.iter().enumerate() {
+                assert!(self.get_numa_node_memory(i).unwrap_or_default() > m);
+            }
+        }
+
+        if let Some(node_ref) = node_ref {
+            // Check each NUMA node has been assigned the right CPUs set.
+            for (i, n) in node_ref.iter().enumerate() {
+                self.check_numa_node_cpus(i, n).unwrap();
+            }
+        }
+
+        if let Some(distance_ref) = distance_ref {
+            // Check each NUMA node has been assigned the right distances.
+            for (i, &d) in distance_ref.iter().enumerate() {
+                assert!(self.check_numa_node_distances(i, d).unwrap());
+            }
+        }
+    }
+
+    pub fn get_pci_bridge_class(&self) -> Result<String, Error> {
+        Ok(self
+            .ssh_command("cat /sys/bus/pci/devices/0000:00:00.0/class")?
+            .trim()
+            .to_string())
+    }
+
+    pub fn get_pci_device_ids(&self) -> Result<String, Error> {
+        Ok(self
+            .ssh_command("cat /sys/bus/pci/devices/*/device")?
+            .trim()
+            .to_string())
+    }
+
+    pub fn get_pci_vendor_ids(&self) -> Result<String, Error> {
+        Ok(self
+            .ssh_command("cat /sys/bus/pci/devices/*/vendor")?
+            .trim()
+            .to_string())
+    }
+
+    pub fn does_device_vendor_pair_match(
+        &self,
+        device_id: &str,
+        vendor_id: &str,
+    ) -> Result<bool, Error> {
+        // We are checking if console device's device id and vendor id pair matches
+        let devices = self.get_pci_device_ids()?;
+        let devices: Vec<&str> = devices.split('\n').collect();
+        let vendors = self.get_pci_vendor_ids()?;
+        let vendors: Vec<&str> = vendors.split('\n').collect();
+
+        for (index, d_id) in devices.iter().enumerate() {
+            if *d_id == device_id
+                && let Some(v_id) = vendors.get(index)
+                && *v_id == vendor_id
+            {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    pub fn check_vsock(&self, socket: &str) {
+        // Listen from guest on vsock CID=3 PORT=16
+        // SOCKET-LISTEN:<domain>:<protocol>:<local-address>
+        let guest_ip = self.network.guest_ip0.clone();
+        let listen_socat = thread::spawn(move || {
+            ssh_command_ip("sudo socat - SOCKET-LISTEN:40:0:x00x00x10x00x00x00x03x00x00x00x00x00x00x00 > vsock_log", &guest_ip, DEFAULT_SSH_RETRIES, DEFAULT_SSH_TIMEOUT).unwrap();
+        });
+
+        // Make sure socat is listening, which might take a few second on slow systems
+        thread::sleep(Duration::new(10, 0));
+
+        // Write something to vsock from the host
+        assert!(
+            exec_host_command_status(&format!(
+                "echo -e \"CONNECT 16\\nHelloWorld!\" | socat - UNIX-CONNECT:{socket}"
+            ))
+            .success()
+        );
+
+        // Wait for the thread to terminate.
+        listen_socat.join().unwrap();
+
+        assert_eq!(
+            self.ssh_command("cat vsock_log").unwrap().trim(),
+            "HelloWorld!"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn check_nvidia_gpu(&self) -> bool {
+        let output = self
+            .ssh_command("nvidia-smi 2>&1; echo CH_NVIDIA_SMI_STATUS:$?")
+            .unwrap_or_else(|e| format!("failed to run nvidia-smi: {e:?}"));
+
+        if output.contains("NVIDIA L40S") {
+            return true;
+        }
+
+        let dmesg = self
+            .ssh_command("sudo dmesg")
+            .unwrap_or_else(|e| format!("Failed to get dmesg: {e:?}"));
+
+        eprintln!(
+            "\n\n==== Guest dmesg (nvidia-smi check failed) ====\n\n\
+             {dmesg}\n\
+             \n==== End guest dmesg ====\n\n"
+        );
+        eprintln!("nvidia-smi diagnostic output: {output}");
+
+        false
+    }
+
+    pub fn reboot_linux(&self, current_reboot_count: u32) {
+        let list_boots_cmd = "sudo last | grep -c reboot";
+        let boot_count = self
+            .ssh_command(list_boots_cmd)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap_or_default();
+
+        assert_eq!(boot_count, current_reboot_count + 1);
+        self.ssh_command("sudo reboot").unwrap();
+
+        self.wait_vm_boot().unwrap();
+        let boot_count = self
+            .ssh_command(list_boots_cmd)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap_or_default();
+        assert_eq!(boot_count, current_reboot_count + 2);
+    }
+
+    pub fn enable_memory_hotplug(&self) {
+        self.ssh_command("echo online | sudo tee /sys/devices/system/memory/auto_online_blocks")
+            .unwrap();
+    }
+
+    pub fn check_devices_common(
+        &self,
+        socket: Option<&String>,
+        console_text: Option<&String>,
+        pmem_path: Option<&String>,
+    ) {
+        // Check block devices are readable
+        self.ssh_command("sudo dd if=/dev/vda of=/dev/null bs=1M iflag=direct count=1024")
+            .unwrap();
+        self.ssh_command("sudo dd if=/dev/vdb of=/dev/null bs=1M iflag=direct count=8")
+            .unwrap();
+        // Check if the rng device is readable
+        self.ssh_command("sudo head -c 1000 /dev/hwrng > /dev/null")
+            .unwrap();
+        // Check vsock
+        if let Some(socket) = socket {
+            self.check_vsock(socket.as_str());
+        }
+        // Check if the console is usable
+        if let Some(console_text) = console_text {
+            let console_cmd = format!("echo {console_text} | sudo tee /dev/hvc0");
+            self.ssh_command(&console_cmd).unwrap();
+        }
+        // The net device is 'automatically' exercised through the above 'ssh' commands
+
+        // Check if the pmem device is usable
+        if let Some(pmem_path) = pmem_path {
+            assert_eq!(
+                self.ssh_command(&format!("ls {pmem_path}")).unwrap().trim(),
+                pmem_path
+            );
+            assert_eq!(
+                self.ssh_command(&format!("sudo mount {pmem_path} /mnt"))
+                    .unwrap(),
+                ""
+            );
+            assert_eq!(self.ssh_command("ls /mnt").unwrap(), "lost+found\n");
+            self.ssh_command("echo test123 | sudo tee /mnt/test")
+                .unwrap();
+            assert_eq!(self.ssh_command("sudo umount /mnt").unwrap(), "");
+            assert_eq!(self.ssh_command("ls /mnt").unwrap(), "");
+
+            assert_eq!(
+                self.ssh_command(&format!("sudo mount {pmem_path} /mnt"))
+                    .unwrap(),
+                ""
+            );
+            assert_eq!(
+                self.ssh_command("sudo cat /mnt/test || true")
+                    .unwrap()
+                    .trim(),
+                "test123"
+            );
+            self.ssh_command("sudo rm /mnt/test").unwrap();
+            assert_eq!(self.ssh_command("sudo umount /mnt").unwrap(), "");
+        }
+    }
+
+    pub fn get_expected_seq_events_for_simple_launch(&self) -> Vec<MetaEvent> {
+        let mut out_evt = vec![
+            MetaEvent {
+                event: "starting".to_string(),
+                device_id: None,
+            },
+            MetaEvent {
+                event: "booting".to_string(),
+                device_id: None,
+            },
+            MetaEvent {
+                event: "booted".to_string(),
+                device_id: None,
+            },
+            MetaEvent {
+                event: "activated".to_string(),
+                device_id: Some("_disk0".to_string()),
+            },
+        ];
+        // For confidential VM, reset of the device does not trigger a VMM exit, or
+        // It is handled in the PSP
+        // so we won't receive the "reset" event for disk0.
+        if self.vm_type != GuestVmType::Confidential {
+            out_evt.push(MetaEvent {
+                event: "reset".to_string(),
+                device_id: Some("_disk0".to_string()),
+            });
+        }
+        out_evt
+    }
+
+    pub fn default_cpus_string(&self) -> String {
+        format!(
+            "boot={}{}",
+            self.num_cpu,
+            if self.nested { "" } else { ",nested=off" }
+        )
+    }
+
+    pub fn default_cpus_with_affinity_string(&self) -> String {
+        format!(
+            "boot={},affinity=[0@[0,2],1@[1,3]]{}",
+            self.num_cpu,
+            if self.nested { "" } else { ",nested=off" }
+        )
+    }
+
+    pub fn default_memory_string(&self) -> String {
+        format!("size={}", self.mem_size_str)
+    }
+
+    pub fn validate_cpu_count(&self, expected_cpu_count: Option<u32>) {
+        let cpu = match expected_cpu_count {
+            Some(count) => count,
+            None => self.num_cpu,
+        };
+        assert_eq!(self.get_cpu_count().unwrap_or_default(), cpu);
+    }
+
+    fn get_expected_memory(&self) -> Option<u32> {
+        // For confidential VMs, the memory available to the guest is less than
+        // the memory assigned to the VM, as some of it is reserved for the PSP
+        // and bounce buffers.
+        // So we return the expected available memory for confidential VMs here.
+        let memory = match self.mem_size_str.as_str() {
+            "512M" => {
+                if self.vm_type == GuestVmType::Confidential {
+                    407_000
+                } else {
+                    400_000
+                }
+            }
+            "1G" => {
+                if self.vm_type == GuestVmType::Confidential {
+                    920_000
+                } else {
+                    960_000
+                }
+            }
+            // More to be added if more memory sizes are used in the tests
+            _ => panic!("Unsupported memory size: {}", self.mem_size_str),
+        };
+        Some(memory)
+    }
+
+    pub fn validate_memory(&self, expected_memory: Option<u32>) {
+        let memory = expected_memory
+            .or_else(|| self.get_expected_memory())
+            .unwrap_or_default();
+
+        let total = self.get_total_memory().unwrap_or_default();
+        assert!(
+            total > memory,
+            "guest MemTotal {total} kB is not greater than expected {memory} kB"
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn add_test_disk(&self, api_socket: &str) {
+        let test_disk_path = String::from(
+            self.tmp_dir
+                .as_path()
+                .join("hotplug_probe.img")
+                .to_str()
+                .unwrap(),
+        );
+        assert!(
+            exec_host_command_status(&format!(
+                "dd if=/dev/zero of={test_disk_path} bs=1M count=16 status=none"
+            ))
+            .success()
+        );
+        assert!(remote_command(
+            api_socket,
+            "add-disk",
+            Some(&format!("path={test_disk_path},id=test0,image_type=raw")),
+        ));
+        assert!(wait_until(Duration::from_secs(10), || {
+            self.ssh_command("lsblk | grep -c vdc || true")
+                .is_ok_and(|s| s.trim().parse::<u32>().is_ok_and(|c| c == 1))
+        }));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub fn remove_test_disk(&self, api_socket: &str) {
+        assert_eq!(
+            self.ssh_command("lsblk | grep -c vdc")
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap_or_default(),
+            1
+        );
+        assert!(remote_command(api_socket, "remove-device", Some("test0")));
+        assert!(wait_until(Duration::from_secs(10), || {
+            self.ssh_command("lsblk | grep -c vdc || true")
+                .is_ok_and(|s| s.trim().parse::<u32>().is_ok_and(|c| c == 0))
+        }));
+    }
+}
+
+// A factory for creating guests with different configurations. The factory is initialized
+// with a GuestVmType, and created guests will have the same GuestVmType as the factory.
+// This allows creation of guests with different configurations (e.g. regular vs confidential)
+// without specifying the GuestVmType each time.
+// Based on the VmType, the default timeout for waiting for the VM to boot is also set,
+// which is used in the wait_vm_boot() method of the Guest struct. Additionally, nested
+// virtualization is disabled by default for confidential VMs, as it is not supported.
+pub struct GuestFactory {
+    vm_type: GuestVmType,
+    boot_timeout: u32,
+    nested: bool,
+}
+
+impl GuestFactory {
+    pub fn new_regular_guest_factory() -> Self {
+        Self {
+            vm_type: GuestVmType::Regular,
+            boot_timeout: DEFAULT_TCP_LISTENER_TIMEOUT,
+            nested: true,
+        }
+    }
+
+    pub fn new_confidential_guest_factory() -> Self {
+        Self {
+            vm_type: GuestVmType::Confidential,
+            boot_timeout: DEFAULT_CVM_TCP_LISTENER_TIMEOUT,
+            nested: false,
+        }
+    }
+
+    pub fn create_guest(&self, disk_config: Box<dyn DiskConfig>) -> Guest {
+        let mut guest = Guest::new(disk_config);
+        guest.vm_type = self.vm_type;
+        guest.boot_timeout = self.boot_timeout;
+        guest.nested = self.nested;
+        guest
+    }
+}
+
+#[derive(Default)]
+pub enum VerbosityLevel {
+    #[default]
+    Warn,
+    Info,
+    Debug,
+}
+
+impl Display for VerbosityLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use VerbosityLevel::*;
+        match self {
+            Warn => (),
+            Info => write!(f, "-v")?,
+            Debug => write!(f, "-vv")?,
+        }
+        Ok(())
+    }
+}
+
+pub struct GuestCommand<'a> {
+    command: Command,
+    guest: &'a Guest,
+    capture_output: bool,
+    print_cmd: bool,
+    verbosity: VerbosityLevel,
+}
+
+impl<'a> GuestCommand<'a> {
+    pub fn new(guest: &'a Guest) -> Self {
+        Self::new_with_binary_path(guest, &clh_command("cloud-hypervisor"))
+    }
+
+    pub fn new_with_binary_path(guest: &'a Guest, binary_path: &str) -> Self {
+        Self {
+            command: Command::new(binary_path),
+            guest,
+            capture_output: false,
+            print_cmd: true,
+            verbosity: VerbosityLevel::Info,
+        }
+    }
+
+    pub fn verbosity(&mut self, verbosity: VerbosityLevel) -> &mut Self {
+        self.verbosity = verbosity;
+        self
+    }
+
+    pub fn capture_output(&mut self) -> &mut Self {
+        self.capture_output = true;
+        self
+    }
+
+    pub fn set_print_cmd(&mut self, print_cmd: bool) -> &mut Self {
+        self.print_cmd = print_cmd;
+        self
+    }
+
+    pub fn spawn(&mut self) -> io::Result<Child> {
+        use VerbosityLevel::*;
+        match &self.verbosity {
+            Warn => {}
+            Info => {
+                self.command.arg("-v");
+            }
+            Debug => {
+                self.command.args(["-vv"]);
+            }
+        }
+
+        if self.print_cmd {
+            println!(
+                "\n\n==== Start cloud-hypervisor command-line ====\n\n\
+                     {:?}\n\
+                     \n==== End cloud-hypervisor command-line ====\n\n",
+                self.command
+            );
+        }
+
+        if self.capture_output {
+            self.command.stderr(Stdio::piped()).stdout(Stdio::piped());
+
+            // The caller should call .wait() on the returned child
+            #[allow(unknown_lints)]
+            #[allow(clippy::zombie_processes)]
+            let child = if let Some(name) = &self.guest.test_name {
+                ProcessRegistry::spawn(name, &mut self.command)?
+            } else {
+                self.command.spawn().unwrap()
+            };
+
+            let fd = child.stdout.as_ref().unwrap().as_raw_fd();
+            let pipesize = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, PIPE_SIZE) };
+            if pipesize == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            let fd = child.stderr.as_ref().unwrap().as_raw_fd();
+            let pipesize1 = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, PIPE_SIZE) };
+            if pipesize1 == -1 {
+                return Err(io::Error::last_os_error());
+            }
+
+            if pipesize >= PIPE_SIZE && pipesize1 >= PIPE_SIZE {
+                Ok(child)
+            } else {
+                Err(io::Error::other(format!(
+                    "resizing pipe w/ 'fnctl' failed: stdout pipesize {pipesize}, stderr pipesize {pipesize1}"
+                )))
+            }
+        } else {
+            // The caller should call .wait() on the returned child
+            #[allow(unknown_lints)]
+            #[allow(clippy::zombie_processes)]
+            if let Some(name) = &self.guest.test_name {
+                ProcessRegistry::spawn(name, &mut self.command)
+            } else {
+                self.command.spawn()
+            }
+        }
+    }
+
+    pub fn args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.command.args(args);
+        self
+    }
+
+    pub fn default_disks(&mut self) -> &mut Self {
+        let os_disk = format!(
+            "path={},image_type=raw",
+            self.guest
+                .disk_config
+                .disk(DiskType::OperatingSystem)
+                .unwrap(),
+        );
+        self.args(["--disk", os_disk.as_str()]);
+        self.default_cloudinit_disk()
+    }
+
+    // Needed for when running old version as part of live upgrade
+    pub fn legacy_default_disks(&mut self) -> &mut Self {
+        let mut disks = vec![
+            "--disk".to_string(),
+            format!(
+                "path={}",
+                self.guest
+                    .disk_config
+                    .disk(DiskType::OperatingSystem)
+                    .unwrap(),
+            ),
+        ];
+        if let Some(cloud_init) = self.guest.disk_config.disk(DiskType::CloudInit) {
+            disks.push(format!("path={cloud_init}"));
+        }
+        self.args(disks)
+    }
+
+    pub fn default_cloudinit_disk(&mut self) -> &mut Self {
+        if let Some(cloud_init) = self.guest.disk_config.disk(DiskType::CloudInit) {
+            self.args([
+                "--disk",
+                format!("path={cloud_init},image_type=raw").as_str(),
+            ]);
+        }
+        self
+    }
+
+    pub fn default_net(&mut self) -> &mut Self {
+        self.args(["--net", self.guest.default_net_string().as_str()])
+    }
+
+    pub fn default_kernel_cmdline_with_platform(&mut self, platform: Option<&str>) -> &mut Self {
+        if self.guest.vm_type == GuestVmType::Confidential {
+            let console_str = if let Some(c) = &self.guest.console_type {
+                c.as_str()
+            } else {
+                "hvc0"
+            };
+            let igvm = direct_igvm_boot_path(Some(console_str))
+                .expect("IGVM boot file not found for console type: {console_str}");
+            self.command.args([
+                "--igvm",
+                igvm.to_str().expect("IGVM path is not valid UTF-8"),
+            ]);
+            // On the KVM direct-kernel path the kernel is supplied separately
+            // (see on_kvm_sev_snp); pass it plus the guest cmdline so
+            // console/serial tests route output as in a regular direct boot.
+            if let Some(kernel) = sev_snp_direct_kernel() {
+                self.command.args([
+                    "--kernel",
+                    kernel.to_str().expect("kernel path is not valid UTF-8"),
+                ]);
+                if let Some(cmdline) = &self.guest.kernel_cmdline {
+                    self.command.args(["--cmdline", cmdline]);
+                }
+                self.command.args(["--fw-cfg-config", "initramfs=off"]);
+            }
+            self.command
+                .args(["--host-data", generate_host_data().as_str()]);
+            self.command.args([
+                "--platform",
+                &format!(
+                    "{}sev_snp=on",
+                    if let Some(p) = platform {
+                        format!("{p},")
+                    } else {
+                        String::new()
+                    }
+                ),
+            ]);
+        } else if let Some(kernel) = &self.guest.kernel_path {
+            self.command.args(["--kernel", kernel.as_str()]);
+            if let Some(cmdline) = &self.guest.kernel_cmdline {
+                self.command.args(["--cmdline", cmdline]);
+            }
+            if let Some(platform_arg) = platform {
+                self.command.args(["--platform", platform_arg]);
+            }
+        }
+
+        self
+    }
+
+    pub fn default_kernel_cmdline(&mut self) -> &mut Self {
+        self.default_kernel_cmdline_with_platform(None)
+    }
+
+    pub fn default_cpus(&mut self) -> &mut Self {
+        self.args(["--cpus", self.guest.default_cpus_string().as_str()])
+    }
+
+    pub fn default_cpus_with_affinity(&mut self) -> &mut Self {
+        // Only support cpu affinity for 2 VCPUs for now,
+        // as it is only used in a test that validates cpu affinity is applied correctly.
+        assert_eq!(self.guest.num_cpu, 2);
+        self.args([
+            "--cpus",
+            self.guest.default_cpus_with_affinity_string().as_str(),
+        ])
+    }
+
+    pub fn default_memory(&mut self) -> &mut Self {
+        self.args(["--memory", self.guest.default_memory_string().as_str()])
+    }
+}
+
+/// Returns the absolute path into the workspaces target directory to locate the desired
+/// executable.
+///
+/// # Arguments
+/// - `cmd`: workspace binary, e.g. `ch-remote` or `cloud-hypervisor`
+pub fn clh_command(cmd: &str) -> String {
+    let workspace_root = workspace_root();
+    let rustc_target = env::var("BUILD_TARGET").unwrap_or("x86_64-unknown-linux-gnu".to_string());
+    let target_artifact_dir = format!("target/{rustc_target}/release");
+    let target_cmd_path = format!("{target_artifact_dir}/{cmd}");
+
+    let full_path = workspace_root.join(&target_cmd_path);
+    String::from(full_path.to_str().unwrap())
+}
+
+pub fn remote_command(api_socket: &str, command: &str, arg: Option<&str>) -> bool {
+    let mut cmd = Command::new(clh_command("ch-remote"));
+    cmd.args([&format!("--api-socket={api_socket}"), command]);
+
+    if let Some(arg) = arg {
+        cmd.arg(arg);
+    }
+
+    let output = cmd.output().unwrap();
+    if output.status.success() {
+        true
+    } else {
+        eprintln!("Error running ch-remote command: {cmd:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprintln!("stderr: {stderr}");
+        false
+    }
+}
+
+pub fn remote_command_w_output(
+    api_socket: &str,
+    command: &str,
+    arg: Option<&str>,
+) -> (bool, Vec<u8> /* stdout */, Vec<u8> /* stderr */) {
+    let mut cmd = Command::new(clh_command("ch-remote"));
+    cmd.args([&format!("--api-socket={api_socket}"), command]);
+
+    if let Some(arg) = arg {
+        cmd.arg(arg);
+    }
+
+    let output = cmd.output().expect("Failed to launch ch-remote");
+
+    (output.status.success(), output.stdout, output.stderr)
+}
+
+pub fn parse_iperf3_output(output: &[u8], sender: bool, bandwidth: bool) -> Result<f64, Error> {
+    panic::catch_unwind(|| {
+        let s = String::from_utf8_lossy(output);
+        let v: Value = serde_json::from_str(&s).expect("'iperf3' parse error: invalid json output");
+
+        if bandwidth {
+            if sender {
+                v["end"]["sum_sent"]["bits_per_second"]
+                    .as_f64()
+                    .expect("'iperf3' parse error: missing entry 'end.sum_sent.bits_per_second'")
+            } else {
+                v["end"]["sum_received"]["bits_per_second"].as_f64().expect(
+                    "'iperf3' parse error: missing entry 'end.sum_received.bits_per_second'",
+                )
+            }
+        } else {
+            // iperf does not distinguish sent vs received in this case.
+
+            let lost_packets = v["end"]["sum"]["lost_packets"]
+                .as_f64()
+                .expect("'iperf3' parse error: missing entry 'end.sum.lost_packets'");
+            let packets = v["end"]["sum"]["packets"]
+                .as_f64()
+                .expect("'iperf3' parse error: missing entry 'end.sum.packets'");
+            let seconds = v["end"]["sum"]["seconds"]
+                .as_f64()
+                .expect("'iperf3' parse error: missing entry 'end.sum.seconds'");
+
+            (packets - lost_packets) / seconds
+        }
+    })
+    .map_err(|_| {
+        eprintln!(
+            "==== Start iperf3 output ===\n\n{}\n\n=== End iperf3 output ===\n\n",
+            String::from_utf8_lossy(output)
+        );
+        Error::Iperf3Parse
+    })
+}
+
+#[derive(Clone)]
+pub enum FioOps {
+    Read,
+    RandomRead,
+    Write,
+    RandomWrite,
+    ReadWrite,
+    RandRW,
+}
+
+impl fmt::Display for FioOps {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            FioOps::Read => write!(f, "read"),
+            FioOps::RandomRead => write!(f, "randread"),
+            FioOps::Write => write!(f, "write"),
+            FioOps::RandomWrite => write!(f, "randwrite"),
+            FioOps::ReadWrite => write!(f, "rw"),
+            FioOps::RandRW => write!(f, "randrw"),
+        }
+    }
+}
+
+pub fn parse_fio_output(output: &str, fio_ops: &FioOps, num_jobs: u32) -> Result<f64, Error> {
+    panic::catch_unwind(|| {
+        let v: Value =
+            serde_json::from_str(output).expect("'fio' parse error: invalid json output");
+        let jobs = v["jobs"]
+            .as_array()
+            .expect("'fio' parse error: missing entry 'jobs'");
+        assert_eq!(
+            jobs.len(),
+            num_jobs as usize,
+            "'fio' parse error: Unexpected number of 'fio' jobs."
+        );
+
+        let (read, write) = match fio_ops {
+            FioOps::Read | FioOps::RandomRead => (true, false),
+            FioOps::Write | FioOps::RandomWrite => (false, true),
+            FioOps::ReadWrite | FioOps::RandRW => (true, true),
+        };
+
+        let mut total_bps = 0_f64;
+        for j in jobs {
+            if read {
+                let bytes = j["read"]["io_bytes"]
+                    .as_u64()
+                    .expect("'fio' parse error: missing entry 'read.io_bytes'");
+                let runtime = j["read"]["runtime"]
+                    .as_u64()
+                    .expect("'fio' parse error: missing entry 'read.runtime'")
+                    as f64
+                    / 1000_f64;
+                total_bps += bytes as f64 / runtime;
+            }
+            if write {
+                let bytes = j["write"]["io_bytes"]
+                    .as_u64()
+                    .expect("'fio' parse error: missing entry 'write.io_bytes'");
+                let runtime = j["write"]["runtime"]
+                    .as_u64()
+                    .expect("'fio' parse error: missing entry 'write.runtime'")
+                    as f64
+                    / 1000_f64;
+                total_bps += bytes as f64 / runtime;
+            }
+        }
+
+        total_bps
+    })
+    .map_err(|_| {
+        eprintln!("=== Start Fio output ===\n\n{output}\n\n=== End Fio output ===\n\n");
+        Error::FioOutputParse
+    })
+}
+
+pub fn parse_fio_output_iops(output: &str, fio_ops: &FioOps, num_jobs: u32) -> Result<f64, Error> {
+    panic::catch_unwind(|| {
+        let v: Value =
+            serde_json::from_str(output).expect("'fio' parse error: invalid json output");
+        let jobs = v["jobs"]
+            .as_array()
+            .expect("'fio' parse error: missing entry 'jobs'");
+        assert_eq!(
+            jobs.len(),
+            num_jobs as usize,
+            "'fio' parse error: Unexpected number of 'fio' jobs."
+        );
+
+        let (read, write) = match fio_ops {
+            FioOps::Read | FioOps::RandomRead => (true, false),
+            FioOps::Write | FioOps::RandomWrite => (false, true),
+            FioOps::ReadWrite | FioOps::RandRW => (true, true),
+        };
+
+        let mut total_iops = 0_f64;
+        for j in jobs {
+            if read {
+                let ios = j["read"]["total_ios"]
+                    .as_u64()
+                    .expect("'fio' parse error: missing entry 'read.total_ios'");
+                let runtime = j["read"]["runtime"]
+                    .as_u64()
+                    .expect("'fio' parse error: missing entry 'read.runtime'")
+                    as f64
+                    / 1000_f64;
+                total_iops += ios as f64 / runtime;
+            }
+            if write {
+                let ios = j["write"]["total_ios"]
+                    .as_u64()
+                    .expect("'fio' parse error: missing entry 'write.total_ios'");
+                let runtime = j["write"]["runtime"]
+                    .as_u64()
+                    .expect("'fio' parse error: missing entry 'write.runtime'")
+                    as f64
+                    / 1000_f64;
+                total_iops += ios as f64 / runtime;
+            }
+        }
+
+        total_iops
+    })
+    .map_err(|_| {
+        eprintln!("=== Start Fio output ===\n\n{output}\n\n=== End Fio output ===\n\n");
+        Error::FioOutputParse
+    })
+}
+
+// Wait the child process for a given timeout
+fn child_wait_timeout(child: &mut Child, timeout: u64) -> Result<(), WaitTimeoutError> {
+    match child.wait_timeout(Duration::from_secs(timeout)) {
+        Err(e) => {
+            return Err(WaitTimeoutError::General(e));
+        }
+        Ok(s) => match s {
+            None => {
+                return Err(WaitTimeoutError::Timedout);
+            }
+            Some(s) => {
+                if !s.success() {
+                    return Err(WaitTimeoutError::ExitStatus);
+                }
+            }
+        },
+    }
+
+    Ok(())
+}
+
+pub fn measure_virtio_net_throughput(
+    test_timeout: u32,
+    queue_pairs: u32,
+    guest: &Guest,
+    receive: bool,
+    bandwidth: bool,
+) -> Result<f64, Error> {
+    let default_port = 5201;
+
+    // 1. start the iperf3 server on the guest
+    for n in 0..queue_pairs {
+        guest.ssh_command(&format!("iperf3 -s -p {} -D", default_port + n))?;
+    }
+
+    thread::sleep(Duration::new(1, 0));
+
+    // 2. start the iperf3 client on host to measure RX through-put
+    let mut clients = Vec::new();
+    for n in 0..queue_pairs {
+        let mut cmd = Command::new("iperf3");
+        cmd.args([
+            "-J", // Output in JSON format
+            "-c",
+            &guest.network.guest_ip0,
+            "-p",
+            &format!("{}", default_port + n),
+            "-t",
+            &format!("{test_timeout}"),
+            "-i",
+            "0",
+        ]);
+        // For measuring the guest transmit throughput (as a sender),
+        // use reverse mode of the iperf3 client on the host
+        if !receive {
+            cmd.args(["-R"]);
+        }
+        // Use UDP stream to measure packets per second. The bitrate is set to
+        // 1T to make sure it saturates the link.
+        if !bandwidth {
+            cmd.args(["-u", "-b", "1T"]);
+        }
+        cmd.stderr(Stdio::piped()).stdout(Stdio::piped());
+        let client = if let Some(name) = &guest.test_name {
+            ProcessRegistry::spawn(name, &mut cmd).map_err(Error::Spawn)?
+        } else {
+            cmd.spawn().map_err(Error::Spawn)?
+        };
+
+        clients.push(client);
+    }
+
+    let mut err: Option<Error> = None;
+    let mut results = Vec::new();
+    let mut failed = false;
+    for c in clients {
+        let mut c = c;
+        if let Err(e) = child_wait_timeout(&mut c, test_timeout as u64 + 5) {
+            err = Some(Error::WaitTimeout(e));
+            failed = true;
+        }
+
+        if failed {
+            let _ = c.kill();
+            let output = c.wait_with_output().unwrap();
+            println!(
+                "=============== Client output [Error] ===============\n\n{}\n\n===========end============\n\n",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        } else {
+            // Safe to unwrap as we know the child has terminated successfully
+            let output = c.wait_with_output().unwrap();
+            results.push(parse_iperf3_output(&output.stdout, receive, bandwidth)?);
+        }
+    }
+
+    if let Some(e) = err {
+        Err(e)
+    } else {
+        Ok(results.iter().sum())
+    }
+}
+
+pub fn parse_ethr_latency_output(output: &[u8]) -> Result<Vec<f64>, Error> {
+    panic::catch_unwind(|| {
+        let s = String::from_utf8_lossy(output);
+        let mut latency = Vec::new();
+        for l in s.lines() {
+            let v: Value = serde_json::from_str(l).expect("'ethr' parse error: invalid json line");
+            // Skip header/summary lines
+            if let Some(avg) = v["Avg"].as_str() {
+                // Assume the latency unit is always "us"
+                latency.push(
+                    avg.split("us").collect::<Vec<&str>>()[0]
+                        .parse::<f64>()
+                        .expect("'ethr' parse error: invalid 'Avg' entry"),
+                );
+            }
+        }
+
+        assert!(
+            !latency.is_empty(),
+            "'ethr' parse error: no valid latency data found"
+        );
+
+        latency
+    })
+    .map_err(|_| {
+        eprintln!(
+            "=== Start ethr output ===\n\n{}\n\n=== End ethr output ===\n\n",
+            String::from_utf8_lossy(output)
+        );
+        Error::EthrLogParse
+    })
+}
+
+pub fn measure_virtio_net_latency(guest: &Guest, test_timeout: u32) -> Result<Vec<f64>, Error> {
+    // copy the 'ethr' tool to the guest image
+    let ethr_path = "/usr/local/bin/ethr";
+    let ethr_remote_path = "/tmp/ethr";
+    scp_to_guest(
+        Path::new(ethr_path),
+        Path::new(ethr_remote_path),
+        &guest.network.guest_ip0,
+        //DEFAULT_SSH_RETRIES,
+        1,
+        DEFAULT_SSH_TIMEOUT,
+    )?;
+
+    // Start the ethr server on the guest
+    guest.ssh_command(&format!("{ethr_remote_path} -s &> /dev/null &"))?;
+
+    thread::sleep(Duration::new(10, 0));
+
+    // Start the ethr client on the host
+    let log_file = guest
+        .tmp_dir
+        .as_path()
+        .join("ethr.client.log")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let mut c = {
+        let mut cmd = Command::new(ethr_path);
+        cmd.args([
+            "-c",
+            &guest.network.guest_ip0,
+            "-t",
+            "l",
+            "-o",
+            &log_file, // file output is JSON format
+            "-d",
+            &format!("{test_timeout}s"),
+        ])
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped());
+        if let Some(name) = &guest.test_name {
+            ProcessRegistry::spawn(name, &mut cmd).map_err(Error::Spawn)?
+        } else {
+            cmd.spawn().map_err(Error::Spawn)?
+        }
+    };
+
+    if let Err(e) = child_wait_timeout(&mut c, test_timeout as u64 + 5).map_err(Error::WaitTimeout)
+    {
+        let _ = c.kill();
+        return Err(e);
+    }
+
+    // Parse the ethr latency test output
+    let content = fs::read(log_file).map_err(Error::EthrLogFile)?;
+    parse_ethr_latency_output(&content)
+}
+
+// parse the bar address from the output of `lspci -vv`
+
+pub fn extract_bar_address(output: &str, device_desc: &str, bar_index: usize) -> Option<String> {
+    let devices: Vec<&str> = output.split("\n\n").collect();
+
+    for device in devices {
+        if device.contains(device_desc) {
+            for line in device.lines() {
+                let line = line.trim();
+                let line_start_str = format!("Region {bar_index}: Memory at");
+                // for example: Region 2: Memory at 200000000 (64-bit, non-prefetchable) [size=1M]
+                if line.starts_with(line_start_str.as_str()) {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 4 {
+                        let addr_str = parts[4];
+                        return Some(String::from(addr_str));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[derive(PartialEq, Clone, Copy, Default)]
+pub enum GuestVmType {
+    #[default]
+    Regular,
+    Confidential,
+}
+
+impl FromStr for GuestVmType {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "regular" => Ok(GuestVmType::Regular),
+            "confidential" => Ok(GuestVmType::Confidential),
+            _ => Err(()),
+        }
+    }
+}
+
+impl Display for GuestVmType {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        match self {
+            GuestVmType::Regular => write!(f, "regular"),
+            GuestVmType::Confidential => write!(f, "confidential"),
+        }
+    }
+}
+
+fn sev_snp_direct_kernel() -> Option<PathBuf> {
+    let kernel_path = PathBuf::from("/igvm_files/bzImage");
+    kernel_path.exists().then_some(kernel_path)
+}
+
+// True on the KVM SEV-SNP direct-kernel path.
+pub fn on_kvm_sev_snp() -> bool {
+    sev_snp_direct_kernel().is_some()
+}
+
+// Get the direct igvm boot file path based on the console type
+fn direct_igvm_boot_path(console: Option<&str>) -> Option<PathBuf> {
+    // get the default hvc0 igvm file if console string is not passed
+    let console_str = console.unwrap_or("hvc0");
+
+    if console_str != "hvc0" && console_str != "ttyS0" {
+        panic!("IGVM console should be hvc0 or ttyS0, got: {console_str}");
+    }
+
+    let igvm_filepath = format!("/igvm_files/linux-{console_str}.bin");
+    if Path::new(&igvm_filepath).exists() {
+        Some(PathBuf::from(igvm_filepath))
+    } else {
+        None
+    }
+}
+
+// Generate a random 64-character hex string for host data
+fn generate_host_data() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// Creates the path for direct kernel boot and return the path.
+// For x86_64, this function returns the vmlinux kernel path.
+// For AArch64, this function returns the PE kernel path.
+pub fn direct_kernel_boot_path() -> PathBuf {
+    let mut workload_path = dirs::home_dir().unwrap();
+    workload_path.push("workloads");
+
+    let mut kernel_path = workload_path;
+    #[cfg(target_arch = "x86_64")]
+    kernel_path.push("vmlinux-x86_64");
+    #[cfg(target_arch = "aarch64")]
+    kernel_path.push("Image-arm64");
+
+    kernel_path
+}
+
+pub fn edk2_path() -> PathBuf {
+    let mut workload_path = dirs::home_dir().unwrap();
+    workload_path.push("workloads");
+    let mut edk2_path = workload_path;
+    edk2_path.push(OVMF_NAME);
+
+    edk2_path
+}
+
+pub const DIRECT_KERNEL_BOOT_CMDLINE: &str =
+    "root=/dev/vda1 console=hvc0 rw systemd.journald.forward_to_console=1";
+
+pub const CONSOLE_TEST_STRING: &str = "Started OpenBSD Secure Shell server";
+
+// Constant taken from the VMM crate.
+pub const MAX_NUM_PCI_SEGMENTS: u16 = 96;
+
+#[cfg(target_arch = "x86_64")]
+pub mod x86_64 {
+    pub const JAMMY_VFIO_IMAGE_NAME: &str =
+        "jammy-server-cloudimg-amd64-custom-vfio-20241012-0.raw";
+    pub const JAMMY_IMAGE_NAME: &str = "jammy-server-cloudimg-amd64-custom-20241017-0.raw";
+    pub const JAMMY_IMAGE_NAME_VHD: &str = "jammy-server-cloudimg-amd64-custom-20241017-0.vhd";
+    pub const JAMMY_IMAGE_NAME_VHDX: &str = "jammy-server-cloudimg-amd64-custom-20241017-0.vhdx";
+    pub const JAMMY_IMAGE_NAME_QCOW2: &str = "jammy-server-cloudimg-amd64-custom-20241017-0.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_ZLIB: &str =
+        "jammy-server-cloudimg-amd64-custom-20241017-0-zlib.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_ZSTD: &str =
+        "jammy-server-cloudimg-amd64-custom-20241017-0-zstd.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_BACKING_ZSTD_FILE: &str =
+        "jammy-server-cloudimg-amd64-custom-20241017-0-backing-zstd.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_BACKING_UNCOMPRESSED_FILE: &str =
+        "jammy-server-cloudimg-amd64-custom-20241017-0-backing-uncompressed.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_BACKING_RAW_FILE: &str =
+        "jammy-server-cloudimg-amd64-custom-20241017-0-backing-raw.qcow2";
+    pub const WINDOWS_IMAGE_NAME: &str = "windows-server-2025-amd64-1.raw";
+    pub const OVMF_NAME: &str = "CLOUDHV.fd";
+    pub const GREP_SERIAL_IRQ_CMD: &str = "grep -c 'IO-APIC.*ttyS0' /proc/interrupts || true";
+}
+
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::*;
+
+#[cfg(target_arch = "aarch64")]
+pub mod aarch64 {
+    pub const JAMMY_IMAGE_NAME: &str = "jammy-server-cloudimg-arm64-custom-20220329-0.raw";
+    pub const JAMMY_IMAGE_NAME_VHD: &str = "jammy-server-cloudimg-arm64-custom-20220329-0.vhd";
+    pub const JAMMY_IMAGE_NAME_VHDX: &str = "jammy-server-cloudimg-arm64-custom-20220329-0.vhdx";
+    pub const JAMMY_IMAGE_NAME_QCOW2: &str = "jammy-server-cloudimg-arm64-custom-20220329-0.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_ZLIB: &str =
+        "jammy-server-cloudimg-arm64-custom-20220329-0-zlib.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_ZSTD: &str =
+        "jammy-server-cloudimg-arm64-custom-20220329-0-zstd.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_BACKING_ZSTD_FILE: &str =
+        "jammy-server-cloudimg-arm64-custom-20220329-0-backing-zstd.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_BACKING_UNCOMPRESSED_FILE: &str =
+        "jammy-server-cloudimg-arm64-custom-20220329-0-backing-uncompressed.qcow2";
+    pub const JAMMY_IMAGE_NAME_QCOW2_BACKING_RAW_FILE: &str =
+        "jammy-server-cloudimg-arm64-custom-20220329-0-backing-raw.qcow2";
+    pub const WINDOWS_IMAGE_NAME: &str = "windows-11-iot-enterprise-aarch64.raw";
+    pub const OVMF_NAME: &str = "CLOUDHV_EFI.fd";
+    pub const GREP_SERIAL_IRQ_CMD: &str = "grep -c 'GICv3.*uart-pl011' /proc/interrupts || true";
+    pub const GREP_PMU_IRQ_CMD: &str = "grep -c 'GICv3.*arm-pmu' /proc/interrupts || true";
+}
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::*;
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    fn is_alive(pid: u32) -> bool {
+        unsafe { libc::kill(pid as i32, 0) == 0 }
+    }
+
+    #[expect(clippy::zombie_processes)]
+    #[test]
+    fn process_registry_spawn_and_cleanup() {
+        let name = "test_spawn_and_cleanup";
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60");
+        let child = ProcessRegistry::spawn(name, &mut cmd).unwrap();
+        let pid = child.id();
+
+        assert!(is_alive(pid));
+        ProcessRegistry::cleanup(name).unwrap();
+        assert!(!is_alive(pid));
+    }
+
+    #[expect(clippy::zombie_processes)]
+    #[test]
+    fn process_registry_shared_group() {
+        let name = "test_shared_group";
+
+        let mut cmd1 = Command::new("sleep");
+        cmd1.arg("60");
+        let child1 = ProcessRegistry::spawn(name, &mut cmd1).unwrap();
+        let pid1 = child1.id();
+
+        let mut cmd2 = Command::new("sleep");
+        cmd2.arg("60");
+        let child2 = ProcessRegistry::spawn(name, &mut cmd2).unwrap();
+        let pid2 = child2.id();
+
+        let pgid1 = unsafe { libc::getpgid(pid1 as i32) };
+        let pgid2 = unsafe { libc::getpgid(pid2 as i32) };
+        assert_eq!(pgid1, pgid2);
+        assert_eq!(pgid1, pid1 as i32);
+
+        ProcessRegistry::cleanup(name).unwrap();
+        assert!(!is_alive(pid1));
+        assert!(!is_alive(pid2));
+    }
+
+    #[test]
+    fn process_registry_cleanup_unknown() {
+        ProcessRegistry::cleanup("nonexistent").unwrap();
+    }
+
+    #[expect(clippy::zombie_processes)]
+    #[test]
+    fn process_registry_stale_group_replaced() {
+        let name = "test_stale_group";
+
+        let mut cmd1 = Command::new("sleep");
+        cmd1.arg("0");
+        let mut child1 = ProcessRegistry::spawn(name, &mut cmd1).unwrap();
+        let pid1 = child1.id();
+        let _ = child1.wait();
+
+        // Group is now stale. Next spawn should create a fresh group.
+        let mut cmd2 = Command::new("sleep");
+        cmd2.arg("60");
+        let child2 = ProcessRegistry::spawn(name, &mut cmd2).unwrap();
+        let pid2 = child2.id();
+
+        assert_ne!(pid1, pid2);
+        let pgid2 = unsafe { libc::getpgid(pid2 as i32) };
+        assert_eq!(pgid2, pid2 as i32);
+
+        ProcessRegistry::cleanup(name).unwrap();
+        assert!(!is_alive(pid2));
+    }
+}

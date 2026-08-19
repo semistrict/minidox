@@ -1,0 +1,569 @@
+// Copyright © 2022, Microsoft Corporation
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+use std::os::unix::io::RawFd;
+use std::path::Path;
+use std::{io, mem, ptr};
+
+use anyhow::anyhow;
+use libc::{sockaddr_storage, socklen_t};
+use log::{debug, error};
+use thiserror::Error;
+
+use crate::socket::SocketDev;
+use crate::{
+    Commands, MemberType, Ptm, PtmCap, PtmEst, PtmInit, PtmResult, PtmSetBufferSize,
+    TPM_CRB_BUFFER_MAX, TPM_SUCCESS,
+};
+
+const TPM_REQ_HDR_SIZE: usize = 10;
+const TPM_RC_INITIALIZE: u32 = 0x100;
+const TPM2_STARTUP_CLEAR: [u8; 12] = [
+    0x80, 0x01, // TPM_ST_NO_SESSIONS
+    0x00, 0x00, 0x00, 0x0c, // commandSize
+    0x00, 0x00, 0x01, 0x44, // TPM_CC_Startup
+    0x00, 0x00, // TPM_SU_CLEAR
+];
+
+fn startup_response_is_ok(response_code: u32) -> bool {
+    response_code == TPM_SUCCESS || response_code == TPM_RC_INITIALIZE
+}
+
+/* capability flags returned by PTM_GET_CAPABILITY */
+const PTM_CAP_INIT: u64 = 1;
+const PTM_CAP_SHUTDOWN: u64 = 1 << 1;
+const PTM_CAP_GET_TPMESTABLISHED: u64 = 1 << 2;
+const PTM_CAP_SET_LOCALITY: u64 = 1 << 3;
+const PTM_CAP_CANCEL_TPM_CMD: u64 = 1 << 5;
+const PTM_CAP_RESET_TPMESTABLISHED: u64 = 1 << 7;
+const PTM_CAP_STOP: u64 = 1 << 10;
+const PTM_CAP_SET_DATAFD: u64 = 1 << 12;
+const PTM_CAP_SET_BUFFERSIZE: u64 = 1 << 13;
+
+///Check if the input command is selftest
+///
+pub fn is_selftest(input: &[u8]) -> bool {
+    if input.len() >= TPM_REQ_HDR_SIZE {
+        let ordinal: &[u8; 4] = input[6..6 + 4]
+            .try_into()
+            .expect("slice with incorrect length");
+
+        return u32::from_ne_bytes(*ordinal).to_be() == 0x143;
+    }
+    false
+}
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("Could not initialize emulator's backend")]
+    InitializeEmulator(#[source] anyhow::Error),
+    #[error("Failed to create data fd to pass to swtpm")]
+    PrepareDataFd(#[source] anyhow::Error),
+    #[error("Failed to run Control Cmd")]
+    RunControlCmd(#[source] anyhow::Error),
+    #[error("Emulator doesn't implement min required capabilities")]
+    CheckCaps(#[source] anyhow::Error),
+    #[error("Emulator failed to deliver request")]
+    DeliverRequest(#[source] anyhow::Error),
+    #[error("Emulator failed to send/receive msg on data fd")]
+    SendReceive(#[source] anyhow::Error),
+    #[error("Incorrect response to Self Test")]
+    SelfTest(#[source] anyhow::Error),
+}
+
+type Result<T> = anyhow::Result<T, Error>;
+
+pub struct BackendCmd<'a> {
+    // This buffer is used for both input and output.
+    // When used for input, the length of the data is input_len.
+    pub buffer: &'a mut [u8],
+    pub input_len: usize,
+}
+
+pub struct Emulator {
+    caps: PtmCap, /* capabilities of the TPM */
+    control_socket: SocketDev,
+    data_fd: RawFd,
+    established_bit_cached: bool,
+    established_bit: bool,
+}
+
+impl Emulator {
+    /// Create Emulator Instance
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - A path to the Unix Domain Socket swtpm is listening on
+    ///
+    pub fn new(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Err(Error::InitializeEmulator(anyhow!(
+                "The input TPM Socket path: {:?} does not exist",
+                path.to_str().unwrap()
+            )));
+        }
+        let mut socket = SocketDev::new();
+        socket.init(path).map_err(|e| {
+            Error::InitializeEmulator(anyhow!("Failed while initializing tpm emulator: {e:?}"))
+        })?;
+
+        let mut emulator = Self {
+            caps: 0,
+            control_socket: socket,
+            data_fd: -1,
+            established_bit_cached: false,
+            established_bit: false,
+        };
+
+        emulator.prepare_data_fd()?;
+
+        emulator.probe_caps()?;
+        if !emulator.check_caps() {
+            return Err(Error::InitializeEmulator(anyhow!(
+                "Required capabilities not supported by tpm backend"
+            )));
+        }
+
+        // Note: The TPM establishment flag can only be queried after the TPM
+        // has been initialized via CMD_INIT. swtpm rejects most control
+        // commands (returning PTM_BAD_ORDINAL = 0x0A) before initialization,
+        // so we defer the establishment-flag check to `get_established_flag()`
+        // which is invoked later (e.g. on guest reads of CRB_LOC_STATE) after
+        // `Tpm::reset()` has issued CMD_INIT.
+
+        Ok(emulator)
+    }
+
+    /// Create socketpair, assign one socket/FD as data_fd to Control Socket
+    /// The other socket/FD will be assigned to msg_fd, which will be sent to swtpm
+    /// via CmdSetDatafd control command
+    fn prepare_data_fd(&mut self) -> Result<()> {
+        let mut res: PtmResult = 0;
+
+        let mut fds = [-1, -1];
+        // SAFETY: FFI calls and return value of the unsafe call is checked
+        unsafe {
+            let ret = libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
+            if ret == -1 {
+                return Err(Error::PrepareDataFd(anyhow!(
+                    "Failed to prepare data fd for tpm emulator. Error Code {:?}",
+                    io::Error::last_os_error()
+                )));
+            }
+        }
+        self.control_socket.set_msgfd(fds[1]);
+        debug!("data fd to be configured in swtpm = {:?}", fds[1]);
+        if let Err(e) = self.run_control_cmd(Commands::CmdSetDatafd, &mut res, 0, size_of::<u32>())
+        {
+            // SAFETY: FFI calls and return values of the unsafe calls are checked
+            unsafe {
+                if libc::close(fds[0]) == -1 {
+                    error!(
+                        "Failed to close TPM data fd after CmdSetDatafd failure: {:?}",
+                        io::Error::last_os_error()
+                    );
+                }
+                if libc::close(fds[1]) == -1 {
+                    error!(
+                        "Failed to close TPM swtpm fd after CmdSetDatafd failure: {:?}",
+                        io::Error::last_os_error()
+                    );
+                }
+            }
+            return Err(e);
+        }
+        // SAFETY: FFI call and return value of the unsafe call is checked
+        unsafe {
+            if libc::close(fds[1]) == -1 {
+                error!(
+                    "Failed to close local TPM swtpm fd: {:?}",
+                    io::Error::last_os_error()
+                );
+            }
+        }
+        debug!("data fd in cloud-hypervisor = {:?}", fds[0]);
+        self.data_fd = fds[0];
+
+        // SAFETY: FFI calls and return value of the unsafe call is checked
+        unsafe {
+            let tv = libc::timeval {
+                tv_sec: 0,
+                tv_usec: 100000, // Set recv timeout to 100ms
+            };
+            let ret = libc::setsockopt(
+                fds[0],
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                (&raw const tv).cast(),
+                size_of::<libc::timeval>() as u32,
+            );
+            if ret == -1 {
+                return Err(Error::PrepareDataFd(anyhow!(
+                    "Failed to set receive timeout on data fd socket. Error Code {:?}",
+                    io::Error::last_os_error()
+                )));
+            }
+        }
+        self.control_socket.set_datafd(fds[0]);
+        Ok(())
+    }
+
+    /// Gather TPM Capabilities and cache them in Emulator
+    ///
+    fn probe_caps(&mut self) -> Result<()> {
+        let mut caps: u64 = 0;
+        self.run_control_cmd(Commands::CmdGetCapability, &mut caps, 0, size_of::<u64>())?;
+        self.caps = caps;
+        Ok(())
+    }
+
+    /// Check if minimum set of capabilities are supported
+    fn check_caps(&mut self) -> bool {
+        /* min. required capabilities for TPM 2.0*/
+        let caps: PtmCap = PTM_CAP_INIT
+            | PTM_CAP_SHUTDOWN
+            | PTM_CAP_GET_TPMESTABLISHED
+            | PTM_CAP_SET_LOCALITY
+            | PTM_CAP_RESET_TPMESTABLISHED
+            | PTM_CAP_SET_DATAFD
+            | PTM_CAP_STOP
+            | PTM_CAP_SET_BUFFERSIZE;
+
+        if (self.caps & caps) != caps {
+            return false;
+        }
+        true
+    }
+
+    ///
+    /// # Arguments
+    ///
+    /// * `cmd` - Control Command to run
+    /// * `msg` - Optional msg to be sent along with Control Command
+    /// * `msg_len_in` - len of 'msg' in bytes, if passed
+    /// * `msg_len_out` - length of expected output from Control Command in bytes
+    ///
+    fn run_control_cmd(
+        &mut self,
+        cmd: Commands,
+        msg: &mut dyn Ptm,
+        msg_len_in: usize,
+        msg_len_out: usize,
+    ) -> Result<()> {
+        debug!("Control Cmd to send : {cmd:02X?}");
+
+        let cmd_no = (cmd as u32).to_be_bytes();
+        let n = size_of::<u32>() + msg_len_in;
+
+        let converted_req = msg.ptm_to_request();
+        debug!("converted request: {converted_req:02X?}");
+
+        let mut buf = Vec::<u8>::with_capacity(n);
+
+        buf.extend(cmd_no);
+        buf.extend(converted_req);
+        debug!("full Control request {buf:02X?}");
+
+        let written = self.control_socket.write(&buf).map_err(|e| {
+            Error::RunControlCmd(anyhow!(
+                "Failed while running {cmd:02X?} Control Cmd. Error: {e:?}"
+            ))
+        })?;
+
+        if written < buf.len() {
+            return Err(Error::RunControlCmd(anyhow!(
+                "Truncated write while running {cmd:02X?} Control Cmd",
+            )));
+        }
+
+        // The largest response is 16 bytes so far.
+        if msg_len_out > 16 {
+            return Err(Error::RunControlCmd(anyhow!(
+                "Response size is too large for Cmd {cmd:02X?}, max 16 wanted {msg_len_out}"
+            )));
+        }
+
+        let mut output = [0u8; 16];
+
+        // Every Control Cmd gets at least a result code (4 bytes) in response.
+        // The full response length is given by `msg_len_out`. On a SOCK_STREAM
+        // socket the response may arrive in more than one chunk, so we cannot
+        // rely on a single `read()` returning the full payload.
+        //
+        // Additionally, when swtpm encounters an error processing a control
+        // command, the swtpm control protocol returns only the 4-byte result
+        // code (e.g. before CMD_INIT some commands return PTM_BAD_ORDINAL =
+        // 0x0A). In that case we must not block waiting for more bytes, so we
+        // first read the 4-byte result code, and only read the remainder of
+        // `msg_len_out` if the command succeeded.
+        let result_len = size_of::<u32>();
+        self.control_socket
+            .read_exact(&mut output, result_len)
+            .map_err(|e| {
+                Error::RunControlCmd(anyhow!(
+                    "Failed while reading result code for Control Cmd: {cmd:02X?}. Error: {e:?}"
+                ))
+            })?;
+
+        let result_code = u32::from_be_bytes(output[0..result_len].try_into().unwrap());
+        if result_code != TPM_SUCCESS {
+            // swtpm returns only the 4-byte result code on error. Propagate
+            // the failure without attempting to read or parse a payload that
+            // will never arrive.
+            msg.set_member_type(MemberType::Response);
+            msg.set_result_code(result_code);
+            return Err(Error::RunControlCmd(anyhow!(
+                "Control Cmd {cmd:02X?} returned error code : {result_code:#X}"
+            )));
+        }
+
+        let read_size = if msg_len_out > result_len {
+            self.control_socket
+                .read_exact(&mut output[result_len..], msg_len_out - result_len)
+                .map_err(|e| {
+                    Error::RunControlCmd(anyhow!(
+                        "Failed while reading response for Control Cmd: {cmd:02X?}. Error: {e:?}"
+                    ))
+                })?;
+            msg_len_out
+        } else {
+            result_len
+        };
+
+        if msg_len_out != 0 {
+            msg.update_ptm_with_response(&output[0..read_size])
+                .map_err(|e| {
+                    Error::RunControlCmd(anyhow!(
+                        "Failed while converting response of Control Cmd: {cmd:02X?} to PTM. Error: {e:?}"
+                    ))
+                })?;
+        } else {
+            // No response expected, only handle return code
+            msg.set_member_type(MemberType::Response);
+        }
+
+        if msg.get_result_code() != TPM_SUCCESS {
+            return Err(Error::RunControlCmd(anyhow!(
+                "Control Cmd returned error code : {:?}",
+                msg.get_result_code()
+            )));
+        }
+        debug!("Control Cmd Response : {:02X?}", &output[0..read_size]);
+        Ok(())
+    }
+
+    /// Returns the value of the TPM Establishment bit as defined by the
+    /// TCG PC Client Platform TPM Profile (PTP) specification:
+    ///   * `true`  - a TPM2_Startup from Locality 3 or 4 has occurred
+    ///   * `false` - default state after a cold reset
+    ///
+    /// The value is cached on first successful query.
+    pub fn get_established_bit(&mut self) -> bool {
+        let mut est: PtmEst = PtmEst::new();
+
+        if self.established_bit_cached {
+            return self.established_bit;
+        }
+
+        if let Err(e) = self.run_control_cmd(
+            Commands::CmdGetTpmEstablished,
+            &mut est,
+            0,
+            2 * size_of::<u32>(),
+        ) {
+            error!("Failed to run CmdGetTpmEstablished Control Cmd. Error: {e:?}");
+            return false;
+        }
+
+        self.established_bit_cached = true;
+        self.established_bit = est.resp.bit != 0;
+
+        self.established_bit
+    }
+
+    /// Function to write to data socket and read the response from it
+    pub fn deliver_request(&mut self, cmd: &mut BackendCmd) -> Result<()> {
+        // SAFETY: type "sockaddr_storage" is valid with an all-zero byte-pattern value
+        let mut addr: sockaddr_storage = unsafe { mem::zeroed() };
+        let mut len = size_of::<sockaddr_storage>() as socklen_t;
+        let isselftest = is_selftest(&cmd.buffer[0..cmd.input_len]);
+
+        debug!(
+            "Send cmd: {:02X?}  of len {:?} on data_ioc ",
+            cmd.buffer, cmd.input_len
+        );
+
+        let mut data_vecs = [libc::iovec {
+            iov_base: cmd.buffer.as_mut_ptr().cast(),
+            iov_len: cmd.input_len,
+        }; 1];
+
+        // SAFETY: all zero values from the unsafe method are updated before usage
+        let mut msghdr: libc::msghdr = unsafe { mem::zeroed() };
+        msghdr.msg_name = ptr::null_mut();
+        msghdr.msg_namelen = 0;
+        msghdr.msg_iov = data_vecs.as_mut_ptr().cast();
+        msghdr.msg_iovlen = data_vecs.len() as _;
+        msghdr.msg_control = ptr::null_mut();
+        msghdr.msg_controllen = 0;
+        msghdr.msg_flags = 0;
+        // SAFETY: FFI call and the return value of the unsafe method is checked
+        unsafe {
+            let ret = libc::sendmsg(self.data_fd, &msghdr, 0);
+            if ret == -1 {
+                return Err(Error::SendReceive(anyhow!(
+                    "Failed to send tpm command over Data FD. Error Code {:?}",
+                    io::Error::last_os_error()
+                )));
+            }
+        }
+
+        let output_len;
+        // SAFETY: FFI calls and return value from unsafe method is checked
+        unsafe {
+            let ret = libc::recvfrom(
+                self.data_fd,
+                cmd.buffer.as_mut_ptr().cast(),
+                cmd.buffer.len(),
+                0,
+                (&raw mut addr).cast(),
+                &raw mut len,
+            );
+            if ret == -1 {
+                return Err(Error::SendReceive(anyhow!(
+                    "Failed to receive response for tpm command over Data FD. Error Code {:?}",
+                    io::Error::last_os_error()
+                )));
+            }
+            output_len = ret as usize;
+        }
+        debug!(
+            "response = {:02X?} len = {:?} selftest = {:?}",
+            cmd.buffer, output_len, isselftest
+        );
+
+        if isselftest && output_len < 10 {
+            return Err(Error::SelfTest(anyhow!(
+                "Self test response should have 10 bytes. Only {output_len:?} returned"
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub fn cancel_cmd(&mut self) -> Result<()> {
+        let mut res: PtmResult = 0;
+
+        // Check if emulator implements Cancel Cmd
+        if (self.caps & PTM_CAP_CANCEL_TPM_CMD) != PTM_CAP_CANCEL_TPM_CMD {
+            return Err(Error::CheckCaps(anyhow!(
+                "Emulator does not implement 'Cancel Command' Capability"
+            )));
+        }
+        self.run_control_cmd(Commands::CmdCancelTpmCmd, &mut res, 0, size_of::<u32>())?;
+        Ok(())
+    }
+
+    /// Configure buffersize to use while communicating with swtpm
+    fn set_buffer_size(&mut self, wantedsize: usize) -> Result<usize> {
+        let mut psbs: PtmSetBufferSize = PtmSetBufferSize::new(wantedsize as u32);
+
+        self.stop_tpm()?;
+
+        self.run_control_cmd(
+            Commands::CmdSetBufferSize,
+            &mut psbs,
+            size_of::<u32>(),
+            4 * size_of::<u32>(),
+        )?;
+
+        Ok(psbs.get_bufsize() as usize)
+    }
+
+    pub fn startup_tpm(&mut self, buffersize: usize) -> Result<()> {
+        let mut init: PtmInit = PtmInit::new();
+
+        if buffersize != 0 {
+            let actual_size = self.set_buffer_size(buffersize)?;
+            debug!("set tpm buffersize to {actual_size:?} during Startup");
+        }
+
+        self.run_control_cmd(
+            Commands::CmdInit,
+            &mut init,
+            size_of::<u32>(),
+            size_of::<u32>(),
+        )?;
+
+        self.tpm2_startup_clear()?;
+
+        Ok(())
+    }
+
+    fn tpm2_startup_clear(&mut self) -> Result<()> {
+        let mut buffer = TPM2_STARTUP_CLEAR;
+        let mut cmd = BackendCmd {
+            buffer: &mut buffer,
+            input_len: TPM2_STARTUP_CLEAR.len(),
+        };
+
+        self.deliver_request(&mut cmd)?;
+
+        let response_code = u32::from_be_bytes(buffer[6..10].try_into().unwrap());
+        if !startup_response_is_ok(response_code) {
+            return Err(Error::DeliverRequest(anyhow!(
+                "TPM2_Startup(CLEAR) returned error code: {response_code:#X}"
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn stop_tpm(&mut self) -> Result<()> {
+        let mut res: PtmResult = 0;
+
+        self.run_control_cmd(Commands::CmdStop, &mut res, 0, size_of::<u32>())?;
+
+        Ok(())
+    }
+
+    pub fn get_buffer_size(&mut self) -> usize {
+        self.set_buffer_size(0).unwrap_or(TPM_CRB_BUFFER_MAX)
+    }
+}
+
+impl Drop for Emulator {
+    fn drop(&mut self) {
+        if self.data_fd >= 0 {
+            // SAFETY: FFI call and return value of the unsafe call is checked
+            unsafe {
+                if libc::close(self.data_fd) == -1 {
+                    error!(
+                        "Failed to close TPM data fd: {:?}",
+                        io::Error::last_os_error()
+                    );
+                }
+            }
+            self.data_fd = -1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn test_startup_response_accepts_success_and_initialized() {
+        assert!(startup_response_is_ok(TPM_SUCCESS));
+        assert!(startup_response_is_ok(TPM_RC_INITIALIZE));
+    }
+
+    #[test]
+    fn test_startup_response_rejects_other_errors() {
+        assert!(!startup_response_is_ok(0x101));
+    }
+}

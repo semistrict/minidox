@@ -1,0 +1,69 @@
+[package]
+authors = ["Microsoft Authors"]
+edition.workspace = true
+license = "Apache-2.0 OR BSD-3-Clause"
+name = "hypervisor"
+rust-version.workspace = true
+version = "0.1.0"
+
+[features]
+kvm = ["kvm-bindings", "kvm-ioctls", "vfio-ioctls/kvm"]
+mshv = ["mshv-bindings", "mshv-ioctls", "mshv_emulator", "vfio-ioctls/mshv"]
+mshv_emulator = ["iced-x86", "mshv-bindings"]
+sev_snp = ["igvm", "igvm_defs"]
+tdx = []
+
+[dependencies]
+anyhow = { workspace = true }
+arc-swap = "1.9.1"
+bitfield-struct = "0.13.0"
+byteorder = { workspace = true }
+cfg-if = { workspace = true }
+concat-idents = "1.1.5"
+igvm = { workspace = true, optional = true }
+igvm_defs = { workspace = true, optional = true }
+kvm-bindings = { workspace = true, optional = true, features = ["serde"] }
+kvm-ioctls = { workspace = true, optional = true }
+libc = { workspace = true }
+log = { workspace = true }
+mshv-bindings = { workspace = true, features = [
+  "fam-wrappers",
+  "with-serde",
+], optional = true }
+mshv-ioctls = { workspace = true, optional = true }
+open-enum = "0.5.2"
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_json = { workspace = true }
+serde_with = { workspace = true, default-features = false, features = [
+  "macros",
+] }
+thiserror = { workspace = true }
+vfio-ioctls = { workspace = true, default-features = false }
+vm-memory = { workspace = true, features = [
+  "backend-atomic",
+  "backend-bitmap",
+  "backend-mmap",
+] }
+vmm-sys-util = { workspace = true, features = ["with-serde"] }
+zerocopy = { workspace = true, features = ["derive"] }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies.iced-x86]
+default-features = false
+features = [
+  "decoder",
+  "instr_info",
+  "no_d3now",
+  "no_evex",
+  "no_vex",
+  "no_xop",
+  "op_code_info",
+  "std",
+]
+optional = true
+version = "1.21.0"
+
+[dev-dependencies]
+env_logger = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,37 @@
+[package]
+authors = ["The Chromium OS Authors"]
+edition.workspace = true
+name = "arch"
+rust-version.workspace = true
+version = "0.1.0"
+
+[features]
+default = []
+fw_cfg = []
+kvm = ["hypervisor/kvm"]
+sev_snp = []
+tdx = []
+
+[dependencies]
+anyhow = { workspace = true }
+byteorder = { workspace = true }
+hypervisor = { path = "../hypervisor" }
+libc = { workspace = true }
+linux-loader = { workspace = true, features = ["bzimage", "elf", "pe"] }
+log = { workspace = true }
+serde = { workspace = true, features = ["derive", "rc"] }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+vm-memory = { workspace = true, features = ["backend-bitmap", "backend-mmap"] }
+vmm-sys-util = { workspace = true, features = ["with-serde"] }
+
+[dev-dependencies]
+proptest = "1.0.0"
+serde_json = { workspace = true }
+
+[target.'cfg(any(target_arch = "aarch64", target_arch = "riscv64"))'.dependencies]
+fdt_parser = { version = "0.1.5", package = "fdt" }
+vm-fdt = { workspace = true }
+
+[lints]
+workspace = true

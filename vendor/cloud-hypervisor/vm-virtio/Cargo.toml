@@ -1,0 +1,24 @@
+[package]
+authors = ["The Cloud Hypervisor Authors"]
+edition.workspace = true
+name = "vm-virtio"
+rust-version.workspace = true
+version = "0.1.0"
+
+[features]
+default = []
+
+[dependencies]
+log = { workspace = true }
+virtio-queue = { workspace = true }
+vm-memory = { workspace = true, features = [
+  "backend-atomic",
+  "backend-bitmap",
+  "backend-mmap",
+] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+virtio-bindings = { workspace = true }

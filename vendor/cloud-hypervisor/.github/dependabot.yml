@@ -1,0 +1,77 @@
+version: 2
+updates:
+- package-ecosystem: cargo
+  directories:
+    - "/"
+    - "/fuzz"
+  schedule:
+    interval: weekly
+  allow:
+    - dependency-name: "acpi_tables"
+    - dependency-name: "iommufd-ioctls"
+    - dependency-name: "kvm-bindings"
+    - dependency-name: "kvm-ioctls"
+    - dependency-name: "linux-loader"
+    - dependency-name: "micro_http"
+    - dependency-name: "mshv-bindings"
+    - dependency-name: "mshv-ioctls"
+    - dependency-name: "seccompiler"
+    - dependency-name: "vfio-bindings"
+    - dependency-name: "vfio-ioctls"
+    - dependency-name: "vfio_user"
+    - dependency-name: "vhost"
+    - dependency-name: "vhost-user-backend"
+    - dependency-name: "virtio-bindings"
+    - dependency-name: "virtio-queue"
+    - dependency-name: "vm-fdt"
+    - dependency-name: "vm-memory"
+    - dependency-name: "vmm-sys-util"
+  groups:
+      rust-vmm:
+        patterns:
+          - "*"
+- package-ecosystem: cargo
+  directories:
+    - "/"
+    - "/fuzz"
+  schedule:
+    interval: weekly
+  allow:
+    - dependency-type: all
+  cooldown:
+    default-days: 7
+    semver-major-days: 14
+    semver-minor-days: 7
+    semver-patch-days: 3
+  ignore:
+    - dependency-name: "acpi_tables"
+    - dependency-name: "iommufd-ioctls"
+    - dependency-name: "kvm-bindings"
+    - dependency-name: "kvm-ioctls"
+    - dependency-name: "linux-loader"
+    - dependency-name: "micro_http"
+    - dependency-name: "mshv-bindings"
+    - dependency-name: "mshv-ioctls"
+    - dependency-name: "seccompiler"
+    - dependency-name: "vfio-bindings"
+    - dependency-name: "vfio-ioctls"
+    - dependency-name: "vfio_user"
+    - dependency-name: "vhost"
+    - dependency-name: "vhost-user-backend"
+    - dependency-name: "virtio-bindings"
+    - dependency-name: "virtio-queue"
+    - dependency-name: "vm-fdt"
+    - dependency-name: "vm-memory"
+    - dependency-name: "vmm-sys-util"
+  groups:
+      non-rust-vmm:
+        patterns:
+          - "*"
+  # Makes it possible to have another config for the same directory.
+  # https://github.com/dependabot/dependabot-core/issues/1778#issuecomment-1988140219
+  target-branch: main
+- package-ecosystem: github-actions
+  directory: "/"
+  schedule:
+    interval: daily
+  open-pull-requests-limit: 1
