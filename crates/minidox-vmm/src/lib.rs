@@ -32,10 +32,18 @@ pub enum Error {
 
 impl Error {
     #[cfg(target_os = "linux")]
-    fn backend(operation: &'static str, error: impl std::fmt::Display) -> Self {
+    fn backend(operation: &'static str, error: impl std::error::Error) -> Self {
+        let mut message = error.to_string();
+        let mut source = error.source();
+        while let Some(cause) = source {
+            message.push_str(": ");
+            message.push_str(&cause.to_string());
+            source = cause.source();
+        }
+
         Self::Backend {
             operation,
-            message: error.to_string(),
+            message,
         }
     }
 }

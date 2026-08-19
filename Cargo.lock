@@ -1001,6 +1001,7 @@ version = "0.1.0"
 dependencies = [
  "hypervisor",
  "seccompiler",
+ "serde_json",
  "thiserror",
  "vmm",
  "vmm-sys-util",

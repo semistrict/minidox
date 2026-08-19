@@ -12,3 +12,6 @@ cloud-hypervisor = { package = "vmm", path = "../../vendor/cloud-hypervisor/vmm"
 cloud-hypervisor-hypervisor = { package = "hypervisor", path = "../../vendor/cloud-hypervisor/hypervisor", features = ["kvm"] }
 seccompiler = "0.5.0"
 vmm-sys-util = "0.15.0"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+serde_json = "1.0.151"
