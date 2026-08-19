@@ -27,7 +27,13 @@ fork. It does not. It is the best starting point because it already has the
 hard-to-reconstruct VM state machinery: synchronous VM/device pause, device
 snapshot traits, dirty logging, restore, and migration. The live recursive CoW
 RAM generation model and the atomic RAM/filesystem fork barrier are minidox
-features regardless of the selected VMM.
+features regardless of the selected VMM. That RAM layer is a contained
+integration, not a novel VMM facility: `userfaultfd` write protection can trap
+the first post-fork write so userspace installs a branch-local page, while KVM's
+dirty bitmap or dirty ring can maintain the changed-page set used for sealing,
+persistence, and compaction. The kernel documents both
+[`UFFDIO_REGISTER_MODE_WP`](https://docs.kernel.org/admin-guide/mm/userfaultfd.html#write-protect-notifications)
+and [KVM dirty logging](https://docs.kernel.org/virt/kvm/api.html#kvm-get-dirty-log).
 
 ## Verified comparison
 
@@ -52,7 +58,13 @@ not upstream guarantees:
 2. **`MAP_PRIVATE` solves only descendants restored from an already materialized
    memory file.** After such a child dirties anonymous CoW pages, recursively
    forking that live child needs a generation-aware memory backend. None of the
-   compared VMMs exposes that abstraction.
+   compared VMMs packages that abstraction, but it is straightforward to add
+   below the VMM's guest-memory interface. The direct same-process mechanism is
+   `userfaultfd` write protection: publish a shared immutable generation, then
+   allocate a branch-local page on the first write fault. KVM dirty logging is
+   complementary bookkeeping for identifying the pages changed by a VM; its
+   dirty ring is per-vCPU and can be flushed by kicking the vCPU out of
+   `KVM_RUN`. [KVM dirty-ring semantics](https://docs.kernel.org/virt/kvm/api.html#kvm-cap-dirty-log-ring-kvm-cap-dirty-log-ring-acq-rel)
 3. **Several library instances probably can coexist, but that is not enough.**
    Cloud Hypervisor's types are the least hostile to several instances, yet
    process-global signal, terminal, metrics, sandboxing, and shutdown behavior
@@ -64,8 +76,11 @@ not upstream guarantees:
    generation-sealed, and only then may the paired RAM and filesystem roots be
    published.
 
-No source reviewed supplies the complete sub-10-ms recursive fork. The latency
-target therefore needs an early KVM prototype before broad device integration.
+No source reviewed packages the complete recursive-fork operation, but the RAM
+side does not make the design speculative. It is a thin generation manager over
+documented Linux mechanisms. A narrow prototype should choose the exact split
+between `userfaultfd` write faults and KVM dirty tracking and measure the pause
+budget before that interface is fixed.
 
 ## Ranked recommendation
 
@@ -88,11 +103,11 @@ target therefore needs an early KVM prototype before broad device integration.
 5. **crosvm as the primary VMM.** Reuse specific virtio/FUSE ideas if useful,
    but do not adopt its process-per-device VMM architecture for this supervisor.
 
-### First validation gate
+### First integration spike
 
 Before importing a large VMM subtree, build one narrow prototype that creates
 two KVM VMs in one process from one RAM generation, pauses one VM, publishes a
 child generation without copying pages, resumes both, and demonstrates
 branch-local writes followed by a recursive child fork. Measure only the pause
-interval. If that cannot remain below 10 ms with representative dirty memory,
-changing the surrounding VMM will not rescue the design.
+interval. This is to settle the RAM-generation interface and quantify the pause,
+not to establish whether recursive CoW is feasible.
