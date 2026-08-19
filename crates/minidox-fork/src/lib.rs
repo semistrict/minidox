@@ -5,6 +5,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use minidox_cache::{BranchingPageCache, CacheError, NodeId};
+use minidox_redoxfs::RedoxBranch;
+
 pub const PAGE_SIZE: usize = 4096;
 
 /// Stable identity of one VM in a fork forest.
@@ -307,6 +310,157 @@ impl Default for ForkForest {
     }
 }
 
+struct SupervisedVm {
+    memory: PageBranch,
+    filesystem: BranchingPageCache<RedoxBranch>,
+}
+
+/// Owns the RAM and RedoxFS/DAX branches for a fork forest.
+pub struct Supervisor {
+    next_vm: u64,
+    next_page: u64,
+    vms: BTreeMap<VmId, SupervisedVm>,
+}
+
+impl Supervisor {
+    pub fn new() -> Self {
+        Self {
+            next_vm: 1,
+            next_page: 1,
+            vms: BTreeMap::new(),
+        }
+    }
+
+    pub fn create_vm(&mut self) -> Result<VmId, Error> {
+        let id = VmId(self.next_vm);
+        self.next_vm += 1;
+        let filesystem = RedoxBranch::create(32 * 1024 * 1024)?;
+        self.vms.insert(
+            id,
+            SupervisedVm {
+                memory: PageBranch::empty(),
+                filesystem: BranchingPageCache::new(filesystem),
+            },
+        );
+        Ok(id)
+    }
+
+    pub fn create_file(&mut self, vm: VmId, name: &str, size: u64) -> Result<NodeId, Error> {
+        self.vms
+            .get_mut(&vm)
+            .ok_or(Error::VmNotFound(vm))?
+            .filesystem
+            .store_mut()
+            .create_file(name, size)
+            .map_err(Into::into)
+    }
+
+    /// Publish one fork point for the source's filesystem cache and RAM.
+    pub fn fork_vm(&mut self, source: VmId) -> Result<VmId, Error> {
+        let source_vm = self.vms.get_mut(&source).ok_or(Error::VmNotFound(source))?;
+        let child_filesystem = source_vm.filesystem.fork()?;
+        let child_memory = source_vm.memory.fork();
+        let child = VmId(self.next_vm);
+        self.next_vm += 1;
+        self.vms.insert(
+            child,
+            SupervisedVm {
+                memory: child_memory,
+                filesystem: child_filesystem,
+            },
+        );
+        Ok(child)
+    }
+
+    pub fn remove_vm(&mut self, vm: VmId) -> Result<(), Error> {
+        self.vms
+            .remove(&vm)
+            .map(|_| ())
+            .ok_or(Error::VmNotFound(vm))
+    }
+
+    pub fn write_file(
+        &mut self,
+        vm: VmId,
+        node: NodeId,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        let cache = &mut self
+            .vms
+            .get_mut(&vm)
+            .ok_or(Error::VmNotFound(vm))?
+            .filesystem;
+        cache.open(node)?;
+        let result = cache.write(node, offset, bytes);
+        let close_result = cache.close(node);
+        result?;
+        close_result?;
+        Ok(())
+    }
+
+    pub fn read_file(
+        &mut self,
+        vm: VmId,
+        node: NodeId,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, Error> {
+        let cache = &mut self
+            .vms
+            .get_mut(&vm)
+            .ok_or(Error::VmNotFound(vm))?
+            .filesystem;
+        cache.open(node)?;
+        let mut bytes = vec![0; len];
+        let result = cache.read(node, offset, &mut bytes);
+        let close_result = cache.close(node);
+        let read = result?;
+        close_result?;
+        bytes.truncate(read);
+        Ok(bytes)
+    }
+
+    pub fn write_memory(
+        &mut self,
+        vm: VmId,
+        guest_address: u64,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        self.vms
+            .get_mut(&vm)
+            .ok_or(Error::VmNotFound(vm))?
+            .memory
+            .write(&mut self.next_page, "", guest_address, bytes)
+    }
+
+    pub fn read_memory(&self, vm: VmId, guest_address: u64, len: usize) -> Result<Vec<u8>, Error> {
+        self.vms
+            .get(&vm)
+            .ok_or(Error::VmNotFound(vm))?
+            .memory
+            .read("", guest_address, len)
+    }
+
+    pub fn page_accounting(&self) -> PageAccounting {
+        let filesystem =
+            BranchingPageCache::page_accounting(self.vms.values().map(|vm| &vm.filesystem));
+        PageAccounting {
+            memory: account_pages(self.vms.values().map(|vm| &vm.memory)),
+            filesystem: SpaceAccounting {
+                resident_pages: filesystem.resident_pages,
+                shared_pages: filesystem.shared_pages,
+            },
+        }
+    }
+}
+
+impl Default for Supervisor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("VM {0:?} does not exist")]
@@ -315,4 +469,8 @@ pub enum Error {
     RangeOverflow,
     #[error("physical page identity space is exhausted")]
     PageIdOverflow,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Cache(#[from] CacheError),
 }

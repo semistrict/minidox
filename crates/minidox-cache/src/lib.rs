@@ -13,6 +13,10 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 
+mod branching;
+
+pub use branching::{BranchingPageCache, CachePageAccounting, DaxPageMapping, ForkableNodeStore};
+
 pub const PAGE_SIZE: u64 = 4096;
 pub type NodeId = u32;
 
@@ -46,6 +50,8 @@ pub enum CacheError {
     InvalidMapping(&'static str),
     NodeNotOpen(NodeId),
     StaleMapping,
+    ActiveMappings,
+    PageBusy,
 }
 
 impl fmt::Display for CacheError {
@@ -55,6 +61,8 @@ impl fmt::Display for CacheError {
             Self::InvalidMapping(message) => f.write_str(message),
             Self::NodeNotOpen(node) => write!(f, "node {node} is not open"),
             Self::StaleMapping => f.write_str("mapping no longer belongs to this cache"),
+            Self::ActiveMappings => f.write_str("cache still has active DAX mappings"),
+            Self::PageBusy => f.write_str("DAX page must be unmapped before copy-on-write"),
         }
     }
 }

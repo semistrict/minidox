@@ -991,6 +991,8 @@ dependencies = [
 name = "minidox-fork"
 version = "0.1.0"
 dependencies = [
+ "minidox-cache",
+ "minidox-redoxfs",
  "thiserror",
 ]
 
@@ -999,6 +1001,7 @@ name = "minidox-redoxfs"
 version = "0.1.0"
 dependencies = [
  "minidox-cache",
+ "redox_syscall",
  "redoxfs",
 ]
 

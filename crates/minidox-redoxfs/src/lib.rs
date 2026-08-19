@@ -1,5 +1,9 @@
 //! Adapter between the extracted mmap cache and the vendored RedoxFS engine.
 
+mod branching;
+
+pub use branching::{BlockAccounting, RedoxBranch};
+
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
