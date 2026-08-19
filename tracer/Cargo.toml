@@ -1,0 +1,18 @@
+[package]
+authors = ["The Cloud Hypervisor Authors"]
+edition.workspace = true
+name = "tracer"
+rust-version.workspace = true
+version = "0.1.0"
+
+[dependencies]
+libc = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_json = { workspace = true }
+
+[features]
+tracing = []
+
+[lints]
+workspace = true

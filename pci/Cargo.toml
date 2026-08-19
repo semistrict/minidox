@@ -1,0 +1,36 @@
+[package]
+authors = ["Samuel Ortiz <sameo@linux.intel.com>"]
+edition.workspace = true
+name = "pci"
+rust-version.workspace = true
+version = "0.1.0"
+
+[features]
+default = []
+kvm = ["hypervisor/kvm", "vfio-ioctls/kvm"]
+mshv = ["hypervisor/mshv", "vfio-ioctls/mshv"]
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+byteorder = { workspace = true }
+hypervisor = { path = "../hypervisor" }
+libc = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+vfio-bindings = { workspace = true, features = ["fam-wrappers"] }
+vfio-ioctls = { workspace = true, default-features = false }
+vfio_user = { workspace = true }
+vm-allocator = { path = "../vm-allocator" }
+vm-device = { path = "../vm-device" }
+vm-memory = { workspace = true, features = [
+  "backend-atomic",
+  "backend-bitmap",
+  "backend-mmap",
+] }
+vm-migration = { path = "../vm-migration" }
+vmm-sys-util = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,307 @@
+# Cloud Hypervisor VFIO HOWTO
+
+VFIO (Virtual Function I/O) is a kernel framework that exposes direct device
+access to userspace. `cloud-hypervisor`, as many VMMs do, uses the VFIO
+framework to directly assign host physical devices to the guest workloads.
+
+## Direct Device Assignment with Cloud Hypervisor
+
+To assign a device to a `cloud-hypervisor` guest, the device needs to be managed
+by the VFIO kernel drivers. However, by default, a host device will be bound to
+its native driver, which is not the VFIO one.
+
+As a consequence, a device must be unbound from its native driver before passing
+it to `cloud-hypervisor` for assigning it to a guest.
+
+### Example
+
+In this example we're going to assign a PCI memory card (SD, MMC, etc) reader
+from the host in a cloud hypervisor guest.
+
+`cloud-hypervisor` only supports assigning PCI devices to its guests. `lspci`
+helps with identifying PCI devices on the host:
+
+```
+$ lspci
+[...]
+01:00.0 Unassigned class [ff00]: Realtek Semiconductor Co., Ltd. RTS525A PCI Express Card Reader (rev 01)
+[...]
+```
+
+Here we see that our device is on bus 1, slot 0 and function 0 (`01:00.0`).
+
+Now that we have identified the device, we must unbind it from its native driver
+(`rtsx_pci`) and bind it to the VFIO driver instead (`vfio_pci`).
+
+First we add VFIO support to the host:
+
+```
+# modprobe -r vfio_pci
+# modprobe -r vfio_iommu_type1
+# modprobe vfio_iommu_type1 allow_unsafe_interrupts
+# modprobe vfio_pci
+```
+
+In case the VFIO drivers are built-in, enable unsafe interrupts with:
+
+```
+# echo 1 > /sys/module/vfio_iommu_type1/parameters/allow_unsafe_interrupts
+```
+
+Then we unbind it from its native driver:
+
+```
+# echo 0000:01:00.0 > /sys/bus/pci/devices/0000\:01\:00.0/driver/unbind
+```
+
+And finally we bind it to the VFIO driver. To do that we first need to get the
+device's VID (Vendor ID) and PID (Product ID):
+
+```
+$ lspci -n -s 01:00.0
+01:00.0 ff00: 10ec:525a (rev 01)
+
+# echo 10ec 525a > /sys/bus/pci/drivers/vfio-pci/new_id
+```
+
+If you have more than one device with the same `vendorID`/`deviceID`, starting
+with the second device, the binding is performed as follows:
+
+```
+# echo 0000:02:00.0 > /sys/bus/pci/drivers/vfio-pci/bind
+```
+
+Now the device is managed by the VFIO framework.
+
+The final step is to give that device to `cloud-hypervisor` to assign it to the
+guest. This is done by using the `--device` command line option. This option
+takes the device's sysfs path as an argument. In our example it is
+`/sys/bus/pci/devices/0000:01:00.0/`:
+
+```
+./target/debug/cloud-hypervisor \
+    --kernel ~/vmlinux \
+    --disk path=~/focal-server-cloudimg-amd64.raw \
+    --console off \
+    --serial tty \
+    --cmdline "console=ttyS0 root=/dev/vda1 rw" \
+    --cpus boot=4 \
+    --memory size=512M \
+    --device path=/sys/bus/pci/devices/0000:01:00.0/
+```
+
+The guest kernel will then detect the card reader on its PCI bus and provided
+that support for this device is enabled, it will probe and enable it for the
+guest to use.
+
+In case you want to pass multiple devices, here is the correct syntax:
+
+```
+--device path=/sys/bus/pci/devices/0000:01:00.0/ path=/sys/bus/pci/devices/0000:02:00.0/
+```
+
+### Multiple devices in the same IOMMU group
+
+There are cases where multiple devices can be found under the same IOMMU group.
+This happens often with graphics card embedding an audio controller.
+
+```
+$ lspci
+[...]
+01:00.0 VGA compatible controller: NVIDIA Corporation GK208B [GeForce GT 710] (rev a1)
+01:00.1 Audio device: NVIDIA Corporation GK208 HDMI/DP Audio Controller (rev a1)
+[...]
+```
+
+This is usually exposed as follows through `sysfs`:
+
+```
+$ ls /sys/kernel/iommu_groups/22/devices/
+0000:01:00.0  0000:01:00.1
+```
+
+This means these two devices are under the same IOMMU group 22. In such case,
+it is important to bind both devices to VFIO and pass them both through the
+VM, otherwise this could cause some functional and security issues.
+
+### Advanced Configuration Options
+
+When using NVIDIA GPUs in a VFIO passthrough configuration, advanced
+configuration options are supported to enable GPUDirect P2P DMA over
+PCIe. When enabled, loads and stores between GPUs use native PCIe
+peer-to-peer transactions instead of a shared memory buffer. This drastically
+decreases P2P latency between GPUs. This functionality is supported by
+cloud-hypervisor on NVIDIA Turing, Ampere, Hopper, and Lovelace GPUs.
+
+The NVIDIA driver does not enable GPUDirect P2P over PCIe within guests
+by default because hardware support for routing P2P TLP between PCIe root
+ports is optional. PCIe P2P should always be supported between devices
+on the same PCIe switch. The `x_nv_gpudirect_clique` config argument may
+be used to signal support for PCIe P2P traffic between NVIDIA VFIO endpoints.
+The guest driver assumes that P2P traffic is supported between all endpoints
+that are part of the same clique.
+```
+--device path=/sys/bus/pci/devices/0000:01:00.0/,x_nv_gpudirect_clique=0
+```
+
+The following command can be run on the guest to verify that GPUDirect P2P is
+correctly enabled.
+```
+nvidia-smi topo -p2p r
+ 	GPU0	GPU1	GPU2	GPU3	GPU4	GPU5	GPU6	GPU7	
+ GPU0	X	OK	OK	OK	OK	OK	OK	OK	
+ GPU1	OK	X	OK	OK	OK	OK	OK	OK	
+ GPU2	OK	OK	X	OK	OK	OK	OK	OK	
+ GPU3	OK	OK	OK	X	OK	OK	OK	OK	
+ GPU4	OK	OK	OK	OK	X	OK	OK	OK	
+ GPU5	OK	OK	OK	OK	OK	X	OK	OK	
+ GPU6	OK	OK	OK	OK	OK	OK	X	OK	
+ GPU7	OK	OK	OK	OK	OK	OK	OK	X	
+```
+
+Some VFIO devices expose BARs that should not be mmapped by the VMM even when
+the kernel reports them as mappable. The `x_exclude_mmap_bars` config argument can
+be used to skip mmap for specific BAR indices.
+
+BAR indices must be between 0 and 5 inclusive. The following example disables
+mmap for BAR 2 of the assigned device:
+
+```
+--device path=/sys/bus/pci/devices/0000:01:00.0/,x_exclude_mmap_bars=[2]
+```
+
+Some VFIO devices have a 32-bit mmio BAR. When using many such devices, it is
+possible to exhaust the 32-bit mmio space available on a PCI segment. The
+following example demonstrates an example device with a 16 MiB 32-bit mmio BAR.
+```
+lspci -s 0000:01:00.0  -v
+0000:01:00.0 3D controller: NVIDIA Corporation Device 26b9 (rev a1)
+    [...]
+    Memory at f9000000 (32-bit, non-prefetchable) [size=16M]
+    Memory at 46000000000 (64-bit, prefetchable) [size=64G]
+    Memory at 48040000000 (64-bit, prefetchable) [size=32M]
+    [...]
+```
+
+When using multiple PCI segments, the 32-bit mmio address space available to
+be allocated to VFIO devices is equally split between all PCI segments by
+default. This can be tuned with the `--pci-segment` flag. The following example
+demonstrates a guest with two PCI segments. 2/3 of the 32-bit mmio address
+space is available for use by devices on PCI segment 0 and 1/3 of the 32-bit
+mmio address space is available for use by devices on PCI segment 1.
+```
+--platform num_pci_segments=2
+--pci-segment pci_segment=0,mmio32_aperture_weight=2
+--pci-segment pci_segment=1,mmio32_aperture_weight=1
+```
+
+## Snapshot and Restore of VFIO Devices
+
+Cloud Hypervisor supports snapshotting and restoring VFIO devices that advertise
+the kernel VFIO migration v2 protocol. Live migration of VFIO devices builds on
+the same protocol and is covered in
+[Live Migration of VFIO Devices](#live-migration-of-vfio-devices).
+
+### Requirements
+
+- **Kernel.** Linux 5.18 or newer for the migration v2 ioctls. 6.0 or newer is
+  recommended for the broadest set of state transitions.
+- **Driver.** The device must be bound to a VFIO variant driver that implements
+  migration v2, for example `mlx5_vfio_pci` on Mellanox NICs. The generic
+  `vfio_pci` driver does not implement migration and is treated as non
+  migratable.
+
+### Behavior
+
+At device creation time, Cloud Hypervisor probes the VFIO device for migration
+support via `VFIO_DEVICE_FEATURE_MIGRATION`. A device that advertises migration
+v2 with at least STOP_COPY is driven through the full state machine on snapshot
+and restore.
+
+Pausing the guest transitions the device to STOP. Snapshot then walks STOP_COPY,
+captures the opaque device state, and returns the device to STOP. On restore, the
+saved device blob is written through RESUMING in a single transition and the
+kernel handles the intermediate STOP arc internally. After the blob loads, Cloud
+Hypervisor pushes the saved PCI_COMMAND to the device and rearms MSI or MSI-X
+eventfds, because the kernel's view of those is not restored by in memory state
+replay alone. The device is left in RESUMING and `resume()` drives it to RUNNING
+when the guest is resumed. This matches QEMU's `vfio_pci_load_config()` behavior.
+
+Migration support is logged at device init.
+
+```
+INFO  vfio: VFIO device 0000:01:00.0 supports migration v2 (flags=0x7, ...)
+```
+
+### Limitations
+
+The current snapshot format stores the blob as base64 inside the snapshot
+JSON. Very large blobs may benefit from a binary transport path in the
+future.
+
+## Live Migration of VFIO Devices
+
+Cloud Hypervisor can live migrate a VM with a migratable VFIO device. Guest
+memory moves according to the selected memory mode while the guest runs. The
+opaque device state is captured through STOP_COPY during the downtime window,
+after the guest is paused, and is loaded on the destination through RESUMING
+before the guest resumes. There is no iterative device state transfer, so a
+large device state extends the downtime accordingly.
+
+### Requirements
+
+All the snapshot and restore requirements apply, plus the following.
+
+- **Dirty tracking.** The variant driver must implement VFIO DMA logging so
+  the pages the device writes to guest memory are tracked during the memory
+  transfer. Without it a precopy migration fails at the start.
+- **iommufd.** The destination receives the device as file descriptors, which
+  requires the config to carry `iommufd=on`. The iommufd itself arrives as a
+  file descriptor with the receive request, see below.
+- **BAR mapping.** `vfio_p2p_dma=off` is needed on older Linux kernels
+  (pre 6.19) that cannot map VFIO BAR MMIO into iommufd.
+- **No virtual IOMMU.** Live migration of a VFIO device behind a virtual
+  IOMMU is not supported and is refused at migration start. Assign the
+  device without a virtual IOMMU.
+
+### Dirty Tracking
+
+When the migration starts, Cloud Hypervisor programs the device with the IOVA
+ranges to track and merges the reported dirty pages into the memory transfer.
+The device sees an identity mapping of guest memory, so the tracked ranges are
+the guest memory layout with iova equal to gpa. Devices behind a virtual IOMMU
+are out of scope, see the requirement above.
+
+### Destination File Descriptors
+
+The device paths and file descriptors in the source configuration are
+meaningless on the destination host. The receive migration request therefore
+carries replacements. Each `vfio_fds` entry pairs a device id with a cdev
+file descriptor opened on the destination, and `iommufd_fd` carries a freshly
+opened iommufd. Both travel over the ch-remote UNIX socket via SCM_RIGHTS.
+
+The destination VF can live at a different BDF than the source's, and the
+kernel assigns its cdev name independently of the device id. The `vfio-dev`
+directory under the VF's sysfs node names the cdev to open.
+
+```console
+dst $ ls /sys/bus/pci/devices/0000:41:00.3/vfio-dev/
+vfio12
+dst $ exec 5<>/dev/vfio/devices/vfio12
+dst $ exec 6<>/dev/iommu
+dst $ ch-remote --api-socket=/tmp/api receive-migration \
+          receiver_url=tcp:0.0.0.0:{port},vfio_fds=[vfio0@5],iommufd_fd=6
+```
+
+The id in each `vfio_fds` entry must match the `id` of the corresponding
+device in the source VM configuration. The same substitution is available on
+snapshot restore through the `vfio_fds` and `iommufd_fd` parameters of the
+restore request, for restoring onto a different VF or host.
+
+### Failure Recovery
+
+A failed migration state transition can leave the device in an indeterminate
+state, including ERROR. Cloud Hypervisor first attempts to return the device
+to a known state and resets it as a last resort, so a failed snapshot or
+migration leaves the guest with a functional device. The original error is
+reported either way.

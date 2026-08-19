@@ -1,0 +1,13 @@
+[general]
+extra-path=scripts/gitlint/rules
+regex-style-search=true
+ignore=body-max-line-length,body-hard-tab
+
+[ignore-by-author-name]
+regex=dependabot
+ignore=all
+
+# default 72
+[title-max-length]
+line-length=72
+

@@ -1,0 +1,17 @@
+[package]
+authors = ["Microsoft Authors"]
+edition = "2021"
+license = "Apache-2.0"
+name = "tpm"
+rust-version.workspace = true
+version = "0.1.0"
+
+[dependencies]
+anyhow = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+vmm-sys-util = { workspace = true }
+
+[lints]
+workspace = true

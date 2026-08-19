@@ -1,0 +1,1031 @@
+// Copyright (c) 2020 Ant Financial
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::collections::BTreeMap;
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Barrier, Mutex};
+use std::{io, result};
+
+use anyhow::anyhow;
+use event_monitor::event;
+use log::{error, info, warn};
+use seccompiler::SeccompAction;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use virtio_queue::{DescriptorChain, Queue, QueueT};
+use vm_device::dma_mapping::ExternalDmaMapping;
+use vm_memory::{
+    Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic,
+    GuestMemoryBackend, GuestMemoryError, GuestMemoryLoadGuard, GuestMemoryRegion,
+};
+use vm_migration::protocol::MemoryRangeTable;
+use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
+use vmm_sys_util::eventfd::EventFd;
+
+use super::{
+    ActivateError, ActivateResult, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError,
+    EpollHelperHandler, Error as DeviceError, VIRTIO_F_VERSION_1, VirtioCommon, VirtioDevice,
+    VirtioDeviceType,
+};
+use crate::device::ActivationContext;
+use crate::seccomp_filters::Thread;
+use crate::{GuestMemoryMmap, GuestRegionMmap, VirtioInterrupt, VirtioInterruptType};
+
+const QUEUE_SIZE: u16 = 128;
+const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE];
+
+// 128MiB is the standard memory block size in Linux. A virtio-mem region must
+// be aligned on this size, and the region size must be a multiple of it.
+pub const VIRTIO_MEM_ALIGN_SIZE: u64 = 128 << 20;
+// Use 2 MiB alignment so transparent hugepages can be used by KVM.
+const VIRTIO_MEM_DEFAULT_BLOCK_SIZE: u64 = 2 << 20;
+
+// Request processed successfully, applicable for
+// - VIRTIO_MEM_REQ_PLUG
+// - VIRTIO_MEM_REQ_UNPLUG
+// - VIRTIO_MEM_REQ_UNPLUG_ALL
+// - VIRTIO_MEM_REQ_STATE
+const VIRTIO_MEM_RESP_ACK: u16 = 0;
+
+// Request denied - e.g. trying to plug more than requested, applicable for
+// - VIRTIO_MEM_REQ_PLUG
+const VIRTIO_MEM_RESP_NACK: u16 = 1;
+
+// Request cannot be processed right now, try again later, applicable for
+// - VIRTIO_MEM_REQ_PLUG
+// - VIRTIO_MEM_REQ_UNPLUG
+// - VIRTIO_MEM_REQ_UNPLUG_ALL
+#[expect(dead_code)]
+const VIRTIO_MEM_RESP_BUSY: u16 = 2;
+
+// Error in request (e.g. addresses/alignment), applicable for
+// - VIRTIO_MEM_REQ_PLUG
+// - VIRTIO_MEM_REQ_UNPLUG
+// - VIRTIO_MEM_REQ_STATE
+const VIRTIO_MEM_RESP_ERROR: u16 = 3;
+
+// State of memory blocks is "plugged"
+const VIRTIO_MEM_STATE_PLUGGED: u16 = 0;
+// State of memory blocks is "unplugged"
+const VIRTIO_MEM_STATE_UNPLUGGED: u16 = 1;
+// State of memory blocks is "mixed"
+const VIRTIO_MEM_STATE_MIXED: u16 = 2;
+
+// request to plug memory blocks
+const VIRTIO_MEM_REQ_PLUG: u16 = 0;
+// request to unplug memory blocks
+const VIRTIO_MEM_REQ_UNPLUG: u16 = 1;
+// request to unplug all blocks and shrink the usable size
+const VIRTIO_MEM_REQ_UNPLUG_ALL: u16 = 2;
+// request information about the plugged state of memory blocks
+const VIRTIO_MEM_REQ_STATE: u16 = 3;
+
+// New descriptors are pending on the virtio queue.
+const QUEUE_AVAIL_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 1;
+
+// Virtio features
+const VIRTIO_MEM_F_ACPI_PXM: u8 = 0;
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("Guest gave us bad memory addresses")]
+    GuestMemory(#[source] GuestMemoryError),
+    #[error("Guest gave us a write only descriptor that protocol says to read from")]
+    UnexpectedWriteOnlyDescriptor,
+    #[error("Guest gave us a read only descriptor that protocol says to write to")]
+    UnexpectedReadOnlyDescriptor,
+    #[error("Guest gave us too few descriptors in a descriptor chain")]
+    DescriptorChainTooShort,
+    #[error("Guest gave us a buffer that was too short to use")]
+    BufferLengthTooSmall,
+    #[error("Guest sent us invalid request")]
+    InvalidRequest,
+    #[error("Resize invalid argument")]
+    ResizeError(#[source] anyhow::Error),
+    #[error("Invalid configuration")]
+    ValidateError(#[source] anyhow::Error),
+    #[error("Failed discarding memory range")]
+    DiscardMemoryRange(#[source] io::Error),
+    #[error("Failed DMA mapping")]
+    DmaMap(#[source] io::Error),
+    #[error("Failed DMA unmapping")]
+    DmaUnmap(#[source] io::Error),
+    #[error("Invalid DMA mapping handler")]
+    InvalidDmaMappingHandler,
+    #[error("Failed adding used index")]
+    QueueAddUsed(#[source] virtio_queue::Error),
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+struct VirtioMemReq {
+    req_type: u16,
+    padding: [u16; 3],
+    addr: u64,
+    nb_blocks: u16,
+    padding_1: [u16; 3],
+}
+
+// SAFETY: it only has data and has no implicit padding.
+unsafe impl ByteValued for VirtioMemReq {}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+struct VirtioMemResp {
+    resp_type: u16,
+    padding: [u16; 3],
+    state: u16,
+}
+
+// SAFETY: it only has data and has no implicit padding.
+unsafe impl ByteValued for VirtioMemResp {}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize)]
+pub struct VirtioMemConfig {
+    // Block size and alignment. Cannot change.
+    block_size: u64,
+    // Valid with VIRTIO_MEM_F_ACPI_PXM. Cannot change.
+    node_id: u16,
+    padding: [u8; 6],
+    // Start address of the memory region. Cannot change.
+    addr: u64,
+    // Region size (maximum). Cannot change.
+    region_size: u64,
+    // Currently usable region size. Can grow up to region_size. Can
+    // shrink due to VIRTIO_MEM_REQ_UNPLUG_ALL (in which case no config
+    // update will be sent).
+    usable_region_size: u64,
+    // Currently used size. Changes due to plug/unplug requests, but no
+    // config updates will be sent.
+    plugged_size: u64,
+    // Requested size. New plug requests cannot exceed it. Can change.
+    requested_size: u64,
+}
+
+// SAFETY: it only has data and has no implicit padding.
+unsafe impl ByteValued for VirtioMemConfig {}
+
+impl VirtioMemConfig {
+    fn validate(&self) -> result::Result<(), Error> {
+        if !self.addr.is_multiple_of(self.block_size) {
+            return Err(Error::ValidateError(anyhow!(
+                "addr 0x{:x} is not aligned on block_size 0x{:x}",
+                self.addr,
+                self.block_size
+            )));
+        }
+        if !self.region_size.is_multiple_of(self.block_size) {
+            return Err(Error::ValidateError(anyhow!(
+                "region_size 0x{:x} is not aligned on block_size 0x{:x}",
+                self.region_size,
+                self.block_size
+            )));
+        }
+        if !self.usable_region_size.is_multiple_of(self.block_size) {
+            return Err(Error::ValidateError(anyhow!(
+                "usable_region_size 0x{:x} is not aligned on block_size 0x{:x}",
+                self.usable_region_size,
+                self.block_size
+            )));
+        }
+        if !self.plugged_size.is_multiple_of(self.block_size) {
+            return Err(Error::ValidateError(anyhow!(
+                "plugged_size 0x{:x} is not aligned on block_size 0x{:x}",
+                self.plugged_size,
+                self.block_size
+            )));
+        }
+        if !self.requested_size.is_multiple_of(self.block_size) {
+            return Err(Error::ValidateError(anyhow!(
+                "requested_size 0x{:x} is not aligned on block_size 0x{:x}",
+                self.requested_size,
+                self.block_size
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn resize(&mut self, size: u64) -> result::Result<(), Error> {
+        if self.requested_size == size {
+            return Err(Error::ResizeError(anyhow!(
+                "new size 0x{size:x} and requested_size are identical"
+            )));
+        } else if size > self.region_size {
+            return Err(Error::ResizeError(anyhow!(
+                "new size 0x{:x} is bigger than region_size 0x{:x}",
+                size,
+                self.region_size
+            )));
+        } else if !size.is_multiple_of(self.block_size) {
+            return Err(Error::ResizeError(anyhow!(
+                "new size 0x{:x} is not aligned on block_size 0x{:x}",
+                size,
+                self.block_size
+            )));
+        }
+
+        self.requested_size = size;
+
+        Ok(())
+    }
+
+    fn is_valid_range(&self, addr: u64, size: u64) -> bool {
+        // Ensure no overflow from adding 'addr' and 'size' whose value are both
+        // controlled by the guest driver
+        if addr.checked_add(size).is_none() {
+            return false;
+        }
+
+        // Start address must be aligned on block_size, the size must be
+        // greater than 0, and all blocks covered by the request must be
+        // in the usable region.
+        if !addr.is_multiple_of(self.block_size)
+            || size == 0
+            || (addr < self.addr || addr + size > self.addr + self.usable_region_size)
+        {
+            return false;
+        }
+
+        true
+    }
+}
+
+struct Request {
+    req: VirtioMemReq,
+    status_addr: GuestAddress,
+}
+
+impl Request {
+    fn parse(
+        desc_chain: &mut DescriptorChain<GuestMemoryLoadGuard<GuestMemoryMmap>>,
+    ) -> result::Result<Request, Error> {
+        let desc = desc_chain.next().ok_or(Error::DescriptorChainTooShort)?;
+        // The descriptor contains the request type which MUST be readable.
+        if desc.is_write_only() {
+            return Err(Error::UnexpectedWriteOnlyDescriptor);
+        }
+        if (desc.len() as usize) < size_of::<VirtioMemReq>() {
+            return Err(Error::InvalidRequest);
+        }
+        if !desc_chain
+            .memory()
+            .check_range(desc.addr(), desc.len() as usize)
+        {
+            return Err(Error::GuestMemory(GuestMemoryError::InvalidGuestAddress(
+                desc.addr(),
+            )));
+        }
+        let req: VirtioMemReq = desc_chain
+            .memory()
+            .read_obj(desc.addr())
+            .map_err(Error::GuestMemory)?;
+
+        let status_desc = desc_chain.next().ok_or(Error::DescriptorChainTooShort)?;
+
+        // The status MUST always be writable
+        if !status_desc.is_write_only() {
+            return Err(Error::UnexpectedReadOnlyDescriptor);
+        }
+
+        if (status_desc.len() as usize) < size_of::<VirtioMemResp>() {
+            return Err(Error::BufferLengthTooSmall);
+        }
+
+        if !desc_chain
+            .memory()
+            .check_range(status_desc.addr(), status_desc.len() as usize)
+        {
+            return Err(Error::GuestMemory(GuestMemoryError::InvalidGuestAddress(
+                status_desc.addr(),
+            )));
+        }
+
+        Ok(Request {
+            req,
+            status_addr: status_desc.addr(),
+        })
+    }
+
+    fn send_response(
+        &self,
+        mem: &GuestMemoryMmap,
+        resp_type: u16,
+        state: u16,
+    ) -> Result<u32, Error> {
+        let resp = VirtioMemResp {
+            resp_type,
+            state,
+            ..Default::default()
+        };
+        mem.write_obj(resp, self.status_addr)
+            .map_err(Error::GuestMemory)?;
+        Ok(size_of::<VirtioMemResp>() as u32)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct BlocksState {
+    bitmap: Vec<bool>,
+}
+
+impl BlocksState {
+    pub fn new(region_size: u64) -> Self {
+        BlocksState {
+            bitmap: vec![false; (region_size / VIRTIO_MEM_DEFAULT_BLOCK_SIZE) as usize],
+        }
+    }
+
+    fn is_range_state(&self, first_block_index: usize, nb_blocks: usize, plug: bool) -> bool {
+        for state in self.bitmap.iter().skip(first_block_index).take(nb_blocks) {
+            if *state != plug {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn set_range(&mut self, first_block_index: usize, nb_blocks: usize, plug: bool) {
+        for state in self
+            .bitmap
+            .iter_mut()
+            .skip(first_block_index)
+            .take(nb_blocks)
+        {
+            *state = plug;
+        }
+    }
+
+    fn inner(&self) -> &Vec<bool> {
+        &self.bitmap
+    }
+
+    pub fn memory_ranges(&self, start_addr: u64, plugged: bool) -> MemoryRangeTable {
+        let mut bitmap: Vec<u64> = Vec::new();
+        let mut i = 0;
+        for (j, bit) in self.bitmap.iter().enumerate() {
+            if j % 64 == 0 {
+                bitmap.push(0);
+
+                if j != 0 {
+                    i += 1;
+                }
+            }
+
+            if *bit == plugged {
+                bitmap[i] |= 1 << (j % 64);
+            }
+        }
+
+        // TODO We can avoid creating a new bitmap here, if we switch the code
+        // to use Vec<u64> to keep dirty bits and just pass it as is.
+        MemoryRangeTable::from_dirty_bitmap(bitmap, start_addr, VIRTIO_MEM_DEFAULT_BLOCK_SIZE)
+    }
+}
+
+struct MemEpollHandler {
+    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    region: Arc<GuestRegionMmap>,
+    host_fd: Option<RawFd>,
+    blocks_state: Arc<Mutex<BlocksState>>,
+    config: Arc<Mutex<VirtioMemConfig>>,
+    queue: Queue,
+    interrupt_cb: Arc<dyn VirtioInterrupt>,
+    queue_evt: EventFd,
+    kill_evt: EventFd,
+    pause_evt: EventFd,
+    hugepages: bool,
+    dma_mapping_handlers: Arc<Mutex<BTreeMap<VirtioMemMappingSource, Arc<dyn ExternalDmaMapping>>>>,
+}
+
+fn usize_to_u64(i: usize) -> u64 {
+    const _: () = assert!(size_of::<usize>() <= size_of::<u64>());
+    i as _
+}
+
+impl MemEpollHandler {
+    /// # Panics
+    ///
+    /// Panics if any of the following hold:
+    /// - region size exceeds [`libc::off64_t::MAX`], [`libc::size_t::MAX`],
+    ///   or [`isize::MAX`]
+    /// - `size + offset` exceeds the size of the region (including overflow).
+    fn discard_memory_range(&self, offset: u64, size: u64) -> Result<(), Error> {
+        let max_size = usize_to_u64(self.region.size());
+
+        // Validate the region size to ensure the below casts
+        // are lossless.
+        libc::size_t::try_from(max_size).unwrap();
+        libc::off64_t::try_from(max_size).unwrap();
+        isize::try_from(max_size).unwrap();
+
+        // Check that offset is in bounds.
+        assert!(max_size >= offset);
+
+        if size == 0 {
+            // Do not try to deallocate a zero size.
+            return Ok(());
+        }
+
+        // Check that offset + size is in bounds and does not overflow.
+        // Since size is checked to be nonzero above, this also means that
+        // offset is not past the end.
+        assert!(max_size - offset >= size);
+
+        // Since offset and size are each bounded above by max_size,
+        // and max_size came from usize and was checked to be able to be
+        // losslessly cast to size_t and off64_t, this also checks that offset
+        // and size can each be losslessly cast to all of these types.
+
+        // Use fallocate if the memory region is backed by a file.
+        if let Some(fd) = self.host_fd {
+            // SAFETY: FFI call with valid arguments
+            let res = unsafe {
+                libc::fallocate64(
+                    fd,
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                    offset as libc::off64_t,
+                    size as libc::off64_t,
+                )
+            };
+            if res != 0 {
+                let err = io::Error::last_os_error();
+                error!("Deallocating file space failed: {err}");
+                return Err(Error::DiscardMemoryRange(err));
+            }
+        }
+
+        // Only use madvise if the memory region is not allocated with
+        // hugepages.
+        if !self.hugepages {
+            // SAFETY: FFI call with valid arguments.
+            // offset + madvize_size was checked in bounds above,
+            // and madvise_size is checked to not be zero so ptr_offset
+            // alone is not past the end.
+            let res = unsafe {
+                libc::madvise(
+                    self.region.as_ptr().offset(offset as isize).cast(),
+                    size as libc::size_t,
+                    libc::MADV_DONTNEED,
+                )
+            };
+            if res != 0 {
+                let err = io::Error::last_os_error();
+                error!("Advising kernel about pages range failed: {err}");
+                return Err(Error::DiscardMemoryRange(err));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn state_change_request(&mut self, addr: u64, nb_blocks: u16, plug: bool) -> u16 {
+        let mut config = self.config.lock().unwrap();
+        let size: u64 = nb_blocks as u64 * config.block_size;
+
+        if plug && (config.plugged_size + size > config.requested_size) {
+            return VIRTIO_MEM_RESP_NACK;
+        }
+        if !config.is_valid_range(addr, size) {
+            return VIRTIO_MEM_RESP_ERROR;
+        }
+
+        let offset = addr - config.addr;
+
+        let first_block_index = (offset / config.block_size) as usize;
+        if !self.blocks_state.lock().unwrap().is_range_state(
+            first_block_index,
+            nb_blocks as usize,
+            !plug,
+        ) {
+            return VIRTIO_MEM_RESP_ERROR;
+        }
+
+        if !plug && let Err(e) = self.discard_memory_range(offset, size) {
+            error!("failed discarding memory range: {e:?}");
+            return VIRTIO_MEM_RESP_ERROR;
+        }
+
+        self.blocks_state
+            .lock()
+            .unwrap()
+            .set_range(first_block_index, nb_blocks as usize, plug);
+
+        let handlers = self.dma_mapping_handlers.lock().unwrap();
+        if plug {
+            let mut gpa = addr;
+            for _ in 0..nb_blocks {
+                for handler in handlers.values() {
+                    if let Err(e) = handler.map(gpa, gpa, config.block_size) {
+                        error!(
+                            "failed DMA mapping addr 0x{:x} size 0x{:x}: {}",
+                            gpa, config.block_size, e
+                        );
+                        return VIRTIO_MEM_RESP_ERROR;
+                    }
+                }
+
+                gpa += config.block_size;
+            }
+
+            config.plugged_size += size;
+        } else {
+            for handler in handlers.values() {
+                if let Err(e) = handler.unmap(addr, size) {
+                    error!("failed DMA unmapping addr 0x{addr:x} size 0x{size:x}: {e}");
+                    return VIRTIO_MEM_RESP_ERROR;
+                }
+            }
+
+            config.plugged_size -= size;
+        }
+
+        VIRTIO_MEM_RESP_ACK
+    }
+
+    fn unplug_all(&mut self) -> u16 {
+        let mut config = self.config.lock().unwrap();
+        if let Err(e) = self.discard_memory_range(0, config.region_size) {
+            error!("failed discarding memory range: {e:?}");
+            return VIRTIO_MEM_RESP_ERROR;
+        }
+
+        // Remaining plugged blocks are unmapped.
+        if config.plugged_size > 0 {
+            let handlers = self.dma_mapping_handlers.lock().unwrap();
+            for (idx, plugged) in self.blocks_state.lock().unwrap().inner().iter().enumerate() {
+                if *plugged {
+                    let gpa = config.addr + (idx as u64 * config.block_size);
+                    for handler in handlers.values() {
+                        if let Err(e) = handler.unmap(gpa, config.block_size) {
+                            error!(
+                                "failed DMA unmapping addr 0x{:x} size 0x{:x}: {}",
+                                gpa, config.block_size, e
+                            );
+                            return VIRTIO_MEM_RESP_ERROR;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.blocks_state.lock().unwrap().set_range(
+            0,
+            (config.region_size / config.block_size) as usize,
+            false,
+        );
+
+        config.plugged_size = 0;
+
+        VIRTIO_MEM_RESP_ACK
+    }
+
+    fn state_request(&self, addr: u64, nb_blocks: u16) -> (u16, u16) {
+        let config = self.config.lock().unwrap();
+        let size: u64 = nb_blocks as u64 * config.block_size;
+
+        if !config.is_valid_range(addr, size) {
+            return (VIRTIO_MEM_RESP_ERROR, 0);
+        }
+
+        let offset = addr - config.addr;
+        let first_block_index = (offset / config.block_size) as usize;
+        let resp_state = if self.blocks_state.lock().unwrap().is_range_state(
+            first_block_index,
+            nb_blocks as usize,
+            true,
+        ) {
+            VIRTIO_MEM_STATE_PLUGGED
+        } else if self.blocks_state.lock().unwrap().is_range_state(
+            first_block_index,
+            nb_blocks as usize,
+            false,
+        ) {
+            VIRTIO_MEM_STATE_UNPLUGGED
+        } else {
+            VIRTIO_MEM_STATE_MIXED
+        };
+
+        (VIRTIO_MEM_RESP_ACK, resp_state)
+    }
+
+    fn signal(&self, int_type: VirtioInterruptType) -> result::Result<(), DeviceError> {
+        self.interrupt_cb.trigger(int_type).map_err(|e| {
+            error!("Failed to signal used queue: {e:?}");
+            DeviceError::FailedSignalingUsedQueue(e)
+        })
+    }
+
+    fn process_queue(&mut self) -> Result<bool, Error> {
+        let mut used_descs = false;
+
+        while let Some(mut desc_chain) = self.queue.pop_descriptor_chain(self.mem.memory()) {
+            let r = match Request::parse(&mut desc_chain) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Failed to parse virtio-mem request: {e}");
+                    self.queue
+                        .add_used(desc_chain.memory(), desc_chain.head_index(), 0)
+                        .map_err(Error::QueueAddUsed)?;
+                    used_descs = true;
+                    continue;
+                }
+            };
+            let (resp_type, resp_state) = match r.req.req_type {
+                VIRTIO_MEM_REQ_PLUG => (
+                    self.state_change_request(r.req.addr, r.req.nb_blocks, true),
+                    0u16,
+                ),
+                VIRTIO_MEM_REQ_UNPLUG => (
+                    self.state_change_request(r.req.addr, r.req.nb_blocks, false),
+                    0u16,
+                ),
+                VIRTIO_MEM_REQ_UNPLUG_ALL => (self.unplug_all(), 0u16),
+                VIRTIO_MEM_REQ_STATE => self.state_request(r.req.addr, r.req.nb_blocks),
+                _ => {
+                    warn!("Unknown request type: {}", r.req.req_type);
+                    (VIRTIO_MEM_RESP_ERROR, 0u16)
+                }
+            };
+            let len = r.send_response(desc_chain.memory(), resp_type, resp_state)?;
+            self.queue
+                .add_used(desc_chain.memory(), desc_chain.head_index(), len)
+                .map_err(Error::QueueAddUsed)?;
+            used_descs = true;
+        }
+
+        Ok(used_descs)
+    }
+
+    fn run(
+        &mut self,
+        paused: &AtomicBool,
+        paused_sync: &Barrier,
+    ) -> result::Result<(), EpollHelperError> {
+        let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
+        helper.add_event(self.queue_evt.as_raw_fd(), QUEUE_AVAIL_EVENT)?;
+        helper.run(paused, paused_sync, self)?;
+
+        Ok(())
+    }
+}
+
+impl EpollHelperHandler for MemEpollHandler {
+    fn handle_event(
+        &mut self,
+        _helper: &mut EpollHelper,
+        event: &epoll::Event,
+    ) -> result::Result<(), EpollHelperError> {
+        let ev_type = event.data as u16;
+        match ev_type {
+            QUEUE_AVAIL_EVENT => {
+                self.queue_evt.read().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {e:?}"))
+                })?;
+
+                let needs_notification = self.process_queue().map_err(|e| {
+                    EpollHelperError::HandleEvent(anyhow!("Failed to process queue : {e:?}"))
+                })?;
+                if needs_notification {
+                    self.signal(VirtioInterruptType::Queue(0)).map_err(|e| {
+                        EpollHelperError::HandleEvent(anyhow!("Failed to signal used queue: {e:?}"))
+                    })?;
+                }
+            }
+            _ => {
+                return Err(EpollHelperError::HandleEvent(anyhow!(
+                    "Unexpected event: {ev_type}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+pub enum VirtioMemMappingSource {
+    Container,
+    Device(u32),
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct MemState {
+    pub avail_features: u64,
+    pub acked_features: u64,
+    pub config: VirtioMemConfig,
+    pub blocks_state: BlocksState,
+}
+
+pub struct Mem {
+    common: VirtioCommon,
+    id: String,
+    region: Arc<GuestRegionMmap>,
+    host_fd: Option<RawFd>,
+    config: Arc<Mutex<VirtioMemConfig>>,
+    seccomp_action: SeccompAction,
+    hugepages: bool,
+    dma_mapping_handlers: Arc<Mutex<BTreeMap<VirtioMemMappingSource, Arc<dyn ExternalDmaMapping>>>>,
+    blocks_state: Arc<Mutex<BlocksState>>,
+    exit_evt: EventFd,
+}
+
+impl Mem {
+    // Create a new virtio-mem device.
+    #[expect(clippy::too_many_arguments)]
+    pub fn new(
+        id: String,
+        region: &Arc<GuestRegionMmap>,
+        seccomp_action: SeccompAction,
+        numa_node_id: Option<u16>,
+        initial_size: u64,
+        hugepages: bool,
+        exit_evt: EventFd,
+        blocks_state: Arc<Mutex<BlocksState>>,
+        state: Option<MemState>,
+    ) -> io::Result<Mem> {
+        let region_len = region.len();
+
+        if region_len != region_len / VIRTIO_MEM_ALIGN_SIZE * VIRTIO_MEM_ALIGN_SIZE {
+            return Err(io::Error::other(format!(
+                "Virtio-mem size is not aligned with {VIRTIO_MEM_ALIGN_SIZE}"
+            )));
+        }
+
+        let (avail_features, acked_features, config, paused) = if let Some(state) = state {
+            info!("Restoring virtio-mem {id}");
+            *(blocks_state.lock().unwrap()) = state.blocks_state.clone();
+            (
+                state.avail_features,
+                state.acked_features,
+                state.config,
+                true,
+            )
+        } else {
+            let mut avail_features = 1u64 << VIRTIO_F_VERSION_1;
+
+            let mut config = VirtioMemConfig {
+                block_size: VIRTIO_MEM_DEFAULT_BLOCK_SIZE,
+                addr: region.start_addr().raw_value(),
+                region_size: region.len(),
+                usable_region_size: region.len(),
+                plugged_size: 0,
+                requested_size: 0,
+                ..Default::default()
+            };
+
+            if initial_size != 0 {
+                config.resize(initial_size).map_err(|e| {
+                    io::Error::other(format!(
+                        "Failed to resize virtio-mem configuration to {initial_size}: {e:?}"
+                    ))
+                })?;
+            }
+
+            if let Some(node_id) = numa_node_id {
+                avail_features |= 1u64 << VIRTIO_MEM_F_ACPI_PXM;
+                config.node_id = node_id;
+            }
+
+            // Make sure the virtio-mem configuration complies with the
+            // specification.
+            config.validate().map_err(|e| {
+                io::Error::other(format!("Invalid virtio-mem configuration: {e:?}"))
+            })?;
+
+            (avail_features, 0, config, false)
+        };
+
+        let host_fd = region
+            .file_offset()
+            .map(|f_offset| f_offset.file().as_raw_fd());
+
+        Ok(Mem {
+            common: VirtioCommon {
+                device_type: VirtioDeviceType::Mem as u32,
+                avail_features,
+                acked_features,
+                paused_sync: Some(Arc::new(Barrier::new(2))),
+                queue_sizes: QUEUE_SIZES.to_vec(),
+                min_queues: 1,
+                paused: Arc::new(AtomicBool::new(paused)),
+                ..Default::default()
+            },
+            id,
+            region: region.clone(),
+            host_fd,
+            config: Arc::new(Mutex::new(config)),
+            seccomp_action,
+            hugepages,
+            dma_mapping_handlers: Arc::new(Mutex::new(BTreeMap::new())),
+            blocks_state,
+            exit_evt,
+        })
+    }
+
+    pub fn plugged_size(&self) -> u64 {
+        self.config.lock().unwrap().plugged_size
+    }
+
+    pub fn resize(&mut self, size: u64) -> result::Result<(), Error> {
+        let mut config = self.config.lock().unwrap();
+        config.resize(size).map_err(|e| {
+            Error::ResizeError(anyhow!("Failed to update virtio configuration: {e:?}"))
+        })?;
+
+        self.common
+            .trigger_interrupt(VirtioInterruptType::Config)
+            .map_err(|e| {
+                Error::ResizeError(anyhow!("Failed to signal the guest about resize: {e:?}"))
+            })
+    }
+
+    pub fn add_dma_mapping_handler(
+        &mut self,
+        source: VirtioMemMappingSource,
+        handler: Arc<dyn ExternalDmaMapping>,
+    ) -> result::Result<(), Error> {
+        let config = self.config.lock().unwrap();
+
+        if config.plugged_size > 0 {
+            for (idx, plugged) in self.blocks_state.lock().unwrap().inner().iter().enumerate() {
+                if *plugged {
+                    let gpa = config.addr + (idx as u64 * config.block_size);
+                    handler
+                        .map(gpa, gpa, config.block_size)
+                        .map_err(Error::DmaMap)?;
+                }
+            }
+        }
+
+        self.dma_mapping_handlers
+            .lock()
+            .unwrap()
+            .insert(source, handler);
+
+        Ok(())
+    }
+
+    pub fn remove_dma_mapping_handler(
+        &mut self,
+        source: &VirtioMemMappingSource,
+    ) -> result::Result<(), Error> {
+        let handler = self
+            .dma_mapping_handlers
+            .lock()
+            .unwrap()
+            .remove(source)
+            .ok_or(Error::InvalidDmaMappingHandler)?;
+
+        let config = self.config.lock().unwrap();
+
+        if config.plugged_size > 0 {
+            for (idx, plugged) in self.blocks_state.lock().unwrap().inner().iter().enumerate() {
+                if *plugged {
+                    let gpa = config.addr + (idx as u64 * config.block_size);
+                    handler
+                        .unmap(gpa, config.block_size)
+                        .map_err(Error::DmaUnmap)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn state(&self) -> MemState {
+        MemState {
+            avail_features: self.common.avail_features,
+            acked_features: self.common.acked_features,
+            config: *(self.config.lock().unwrap()),
+            blocks_state: self.blocks_state.lock().unwrap().clone(),
+        }
+    }
+
+    #[cfg(fuzzing)]
+    pub fn wait_for_epoll_threads(&mut self) {
+        self.common.wait_for_epoll_threads();
+    }
+}
+
+impl VirtioDevice for Mem {
+    fn device_type(&self) -> u32 {
+        self.common.device_type
+    }
+
+    fn queue_max_sizes(&self) -> &[u16] {
+        &self.common.queue_sizes
+    }
+
+    fn features(&self) -> u64 {
+        self.common.avail_features
+    }
+
+    fn ack_features(&mut self, value: u64) {
+        self.common.ack_features(value);
+    }
+
+    fn read_config(&self, offset: u64, data: &mut [u8]) {
+        self.read_config_from_slice(self.config.lock().unwrap().as_slice(), offset, data);
+    }
+
+    fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+        let ActivationContext {
+            mem,
+            interrupt_cb,
+            mut queues,
+            device_status,
+        } = context;
+        self.common.activate(&queues, interrupt_cb.clone())?;
+        let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
+
+        let (_, queue, queue_evt) = queues.remove(0);
+
+        let mut handler = MemEpollHandler {
+            mem,
+            region: self.region.clone(),
+            host_fd: self.host_fd,
+            blocks_state: Arc::clone(&self.blocks_state),
+            config: self.config.clone(),
+            queue,
+            interrupt_cb: interrupt_cb.clone(),
+            queue_evt,
+            kill_evt,
+            pause_evt,
+            hugepages: self.hugepages,
+            dma_mapping_handlers: Arc::clone(&self.dma_mapping_handlers),
+        };
+
+        let unplugged_memory_ranges = self.blocks_state.lock().unwrap().memory_ranges(0, false);
+        for range in unplugged_memory_ranges.regions() {
+            handler
+                .discard_memory_range(range.gpa, range.length)
+                .map_err(|e| {
+                    error!(
+                        "failed discarding memory range [0x{:x}-0x{:x}]: {:?}",
+                        range.gpa,
+                        range.gpa + range.length - 1,
+                        e
+                    );
+                    ActivateError::BadActivate
+                })?;
+        }
+
+        let paused = self.common.paused.clone();
+        let paused_sync = self.common.paused_sync.clone();
+
+        self.common.spawn_worker(
+            &self.id,
+            &self.seccomp_action,
+            Thread::VirtioMem,
+            &self.exit_evt,
+            device_status.clone(),
+            interrupt_cb.clone(),
+            move || handler.run(&paused, paused_sync.as_ref().unwrap()),
+        )?;
+
+        event!("virtio-device", "activated", "id", &self.id);
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.common.reset();
+        event!("virtio-device", "reset", "id", &self.id);
+    }
+}
+
+impl Pausable for Mem {
+    fn pause(&mut self) -> result::Result<(), MigratableError> {
+        self.common.pause()
+    }
+
+    fn resume(&mut self) -> result::Result<(), MigratableError> {
+        self.common.resume()
+    }
+}
+
+impl Snapshottable for Mem {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
+        Snapshot::new_from_state(&self.state())
+    }
+}
+impl Transportable for Mem {}
+impl Migratable for Mem {}

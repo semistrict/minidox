@@ -1,0 +1,32 @@
+[package]
+authors = ["The Chromium OS Authors"]
+edition.workspace = true
+name = "net_util"
+rust-version.workspace = true
+version = "0.1.0"
+
+[dependencies]
+epoll = { workspace = true }
+getrandom = "0.4.2"
+libc = { workspace = true }
+log = { workspace = true }
+rate_limiter = { path = "../rate_limiter" }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+virtio-bindings = { workspace = true }
+virtio-queue = { workspace = true }
+vm-memory = { workspace = true, features = [
+  "backend-atomic",
+  "backend-bitmap",
+  "backend-mmap",
+] }
+vm-virtio = { path = "../vm-virtio" }
+vmm-sys-util = { workspace = true }
+
+[dev-dependencies]
+pnet = "0.35.0"
+pnet_datalink = "0.35.0"
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

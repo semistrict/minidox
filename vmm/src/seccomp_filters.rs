@@ -1,0 +1,1274 @@
+// Copyright 2018 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+//
+// Copyright © 2020 Intel Corporation
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use std::env::consts;
+
+use hypervisor::HypervisorType;
+use libc::{
+    BLKIOMIN, BLKIOOPT, BLKPBSZGET, BLKSSZGET, FIOCLEX, FIONBIO, SIOCGIFFLAGS, SIOCGIFHWADDR,
+    SIOCGIFINDEX, SIOCGIFMTU, SIOCSIFADDR, SIOCSIFFLAGS, SIOCSIFHWADDR, SIOCSIFMTU, SIOCSIFNETMASK,
+    TCGETS, TCGETS2, TCSETS, TCSETS2, TIOCGPGRP, TIOCGPTPEER, TIOCGWINSZ, TIOCSCTTY, TIOCSPGRP,
+    TIOCSPTLCK, TUNGETFEATURES, TUNGETIFF, TUNSETIFF, TUNSETOFFLOAD, TUNSETVNETHDRSZ,
+};
+use seccompiler::SeccompCmpOp::{Eq, MaskedEq};
+use seccompiler::{
+    BackendError, BpfProgram, Error, SeccompAction, SeccompCmpArgLen as ArgLen,
+    SeccompCondition as Cond, SeccompFilter, SeccompRule,
+};
+use vhost::vhost_kern::vhost_binding::{
+    VHOST_GET_BACKEND_FEATURES, VHOST_GET_FEATURES, VHOST_SET_BACKEND_FEATURES, VHOST_SET_FEATURES,
+    VHOST_SET_OWNER, VHOST_SET_VRING_ADDR, VHOST_SET_VRING_BASE, VHOST_SET_VRING_CALL,
+    VHOST_SET_VRING_KICK, VHOST_SET_VRING_NUM, VHOST_VDPA_GET_CONFIG, VHOST_VDPA_GET_CONFIG_SIZE,
+    VHOST_VDPA_GET_DEVICE_ID, VHOST_VDPA_GET_IOVA_RANGE, VHOST_VDPA_GET_STATUS,
+    VHOST_VDPA_GET_VRING_NUM, VHOST_VDPA_SET_CONFIG, VHOST_VDPA_SET_CONFIG_CALL,
+    VHOST_VDPA_SET_STATUS, VHOST_VDPA_SET_VRING_ENABLE, VHOST_VDPA_SUSPEND,
+};
+
+use crate::userfaultfd::{
+    UFFDIO_API, UFFDIO_CONTINUE, UFFDIO_COPY, UFFDIO_REGISTER, UFFDIO_WAKE, USERFAULTFD_IOC_NEW,
+};
+
+#[derive(Copy, Clone)]
+pub enum Thread {
+    HttpApi,
+    #[cfg(feature = "dbus_api")]
+    DBusApi,
+    EventMonitor,
+    /// Thread handling the migration on the sending side.
+    MigrationWorker,
+    /// Key used for the TCP workers for send and receive, as well as the accept
+    /// thread on the receiver side.
+    MigrationTcpWorker,
+    SignalHandler,
+    Vcpu,
+    Vmm,
+    PtyForeground,
+    SerialManager,
+    MigrateSendPostcopy,
+}
+
+/// Shorthand for chaining `SeccompCondition`s with the `and` operator  in a `SeccompRule`.
+/// The rule will take the `Allow` action if _all_ the conditions are true.
+///
+/// [`SeccompCondition`]: struct.SeccompCondition.html
+/// [`SeccompRule`]: struct.SeccompRule.html
+macro_rules! and {
+    ($($x:expr),*) => (SeccompRule::new(vec![$($x),*]).unwrap())
+}
+
+/// Shorthand for chaining `SeccompRule`s with the `or` operator in a `SeccompFilter`.
+///
+/// [`SeccompFilter`]: struct.SeccompFilter.html
+/// [`SeccompRule`]: struct.SeccompRule.html
+macro_rules! or {
+    ($($x:expr,)*) => (vec![$($x),*]);
+    ($($x:expr),*) => (vec![$($x),*])
+}
+
+// See include/uapi/linux/vfio.h in the kernel code.
+const VFIO_GET_API_VERSION: u64 = 0x3b64;
+const VFIO_CHECK_EXTENSION: u64 = 0x3b65;
+const VFIO_SET_IOMMU: u64 = 0x3b66;
+const VFIO_GROUP_GET_STATUS: u64 = 0x3b67;
+const VFIO_GROUP_SET_CONTAINER: u64 = 0x3b68;
+const VFIO_GROUP_UNSET_CONTAINER: u64 = 0x3b69;
+const VFIO_GROUP_GET_DEVICE_FD: u64 = 0x3b6a;
+const VFIO_DEVICE_GET_INFO: u64 = 0x3b6b;
+const VFIO_DEVICE_GET_REGION_INFO: u64 = 0x3b6c;
+const VFIO_DEVICE_GET_IRQ_INFO: u64 = 0x3b6d;
+const VFIO_DEVICE_SET_IRQS: u64 = 0x3b6e;
+const VFIO_DEVICE_RESET: u64 = 0x3b6f;
+const VFIO_IOMMU_MAP_DMA: u64 = 0x3b71;
+const VFIO_IOMMU_UNMAP_DMA: u64 = 0x3b72;
+const VFIO_DEVICE_IOEVENTFD: u64 = 0x3b74;
+const VFIO_DEVICE_FEATURE: u64 = 0x3b75;
+
+// See include/uapi/linux/kvm.h in the kernel code.
+#[cfg(feature = "kvm")]
+mod kvm {
+    pub const KVM_GET_API_VERSION: u64 = 0xae00;
+    pub const KVM_CREATE_VM: u64 = 0xae01;
+    pub const KVM_CHECK_EXTENSION: u64 = 0xae03;
+    pub const KVM_GET_VCPU_MMAP_SIZE: u64 = 0xae04;
+    pub const KVM_CREATE_VCPU: u64 = 0xae41;
+    pub const KVM_CREATE_IRQCHIP: u64 = 0xae60;
+    pub const KVM_RUN: u64 = 0xae80;
+    pub const KVM_SET_MP_STATE: u64 = 0x4004_ae99;
+    pub const KVM_SET_GSI_ROUTING: u64 = 0x4008_ae6a;
+    pub const KVM_SET_DEVICE_ATTR: u64 = 0x4018_aee1;
+    pub const KVM_HAS_DEVICE_ATTR: u64 = 0x4018_aee3;
+    pub const KVM_SET_ONE_REG: u64 = 0x4010_aeac;
+    pub const KVM_SET_USER_MEMORY_REGION: u64 = 0x4020_ae46;
+    pub const KVM_SET_USER_MEMORY_REGION2: u64 = 0x40a0_ae49;
+    pub const KVM_SET_MEMORY_ATTRIBUTES: u64 = 0x4020_aed2;
+    pub const KVM_CREATE_GUEST_MEMFD: u64 = 0xc040_aed4;
+    pub const KVM_IRQFD: u64 = 0x4020_ae76;
+    pub const KVM_IOEVENTFD: u64 = 0x4040_ae79;
+    pub const KVM_SET_VCPU_EVENTS: u64 = 0x4040_aea0;
+    pub const KVM_ENABLE_CAP: u64 = 0x4068_aea3;
+    pub const KVM_SET_REGS: u64 = 0x4090_ae82;
+    pub const KVM_GET_MP_STATE: u64 = 0x8004_ae98;
+    pub const KVM_GET_DEVICE_ATTR: u64 = 0x4018_aee2;
+    pub const KVM_GET_DIRTY_LOG: u64 = 0x4010_ae42;
+    pub const KVM_GET_VCPU_EVENTS: u64 = 0x8040_ae9f;
+    pub const KVM_GET_ONE_REG: u64 = 0x4010_aeab;
+    pub const KVM_GET_REGS: u64 = 0x8090_ae81;
+    pub const KVM_GET_SUPPORTED_CPUID: u64 = 0xc008_ae05;
+    pub const KVM_CREATE_DEVICE: u64 = 0xc00c_aee0;
+    pub const KVM_GET_REG_LIST: u64 = 0xc008_aeb0;
+    pub const KVM_MEMORY_ENCRYPT_OP: u64 = 0xc008_aeba;
+    pub const KVM_NMI: u64 = 0xae9a;
+    pub const KVM_GET_NESTED_STATE: u64 = 3229658814;
+    pub const KVM_SET_NESTED_STATE: u64 = 1082175167;
+    pub const KVM_SEV_SNP_LAUNCH_START: u64 = 0x4018_aeb4;
+    pub const KVM_SEV_SNP_LAUNCH_UPDATE: u64 = 0x8018_aeb5;
+    pub const KVM_SEV_SNP_LAUNCH_FINISH: u64 = 0x4008_aeb7;
+}
+
+mod iommufd {
+    // See include/uapi/linux/iommufd.h in the kernel code.
+    pub const IOMMU_DESTROY: u64 = 0x3b80;
+    pub const IOMMU_IOAS_ALLOC: u64 = 0x3b81;
+    pub const IOMMU_IOAS_MAP: u64 = 0x3b85;
+    pub const IOMMU_IOAS_UNMAP: u64 = 0x3b86;
+
+    // See include/uapi/linux/vfio.h in the kernel code.
+    pub const VFIO_DEVICE_BIND_IOMMUFD: u64 = 0x3b76;
+    pub const VFIO_DEVICE_ATTACH_IOMMUFD_PT: u64 = 0x3b77;
+    pub const VFIO_DEVICE_DETACH_IOMMUFD_PT: u64 = 0x3b78;
+}
+
+// Block device ioctls (not exported by libc)
+const BLKDISCARD: u64 = 0x1277; // _IO(0x12, 119)
+const BLKZEROOUT: u64 = 0x127f; // _IO(0x12, 127)
+const BLKGETSIZE64: u64 = 0x80081272; // _IOR(0x12, 114, size_t)
+
+// MSHV IOCTL code. This is unstable until the kernel code has been declared stable.
+#[cfg(feature = "mshv")]
+use hypervisor::mshv::mshv_ioctls::*;
+#[cfg(feature = "kvm")]
+use kvm::*;
+
+#[cfg(feature = "mshv")]
+fn create_vmm_ioctl_seccomp_rule_common_mshv() -> Result<Vec<SeccompRule>, BackendError> {
+    Ok(or![
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_CREATE_PARTITION())?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            MSHV_INITIALIZE_PARTITION()
+        )?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_SET_GUEST_MEMORY())?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            MSHV_GET_HOST_PARTITION_PROPERTY()
+        )?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_CREATE_VP())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_IRQFD())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_IOEVENTFD())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_SET_MSI_ROUTING())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_GET_VP_REGISTERS())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_SET_VP_REGISTERS())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_RUN_VP())?],
+        #[cfg(target_arch = "x86_64")]
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_GET_VP_STATE())?],
+        #[cfg(target_arch = "x86_64")]
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_SET_VP_STATE())?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            MSHV_SET_PARTITION_PROPERTY()
+        )?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            MSHV_GET_PARTITION_PROPERTY()
+        )?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            MSHV_GET_GPAP_ACCESS_BITMAP()
+        )?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_VP_TRANSLATE_GVA())?],
+        #[cfg(target_arch = "x86_64")]
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            MSHV_VP_REGISTER_INTERCEPT_RESULT()
+        )?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_CREATE_DEVICE())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_SET_DEVICE_ATTR())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_GET_VP_CPUID_VALUES())?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            MSHV_MODIFY_GPA_HOST_ACCESS()
+        )?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            MSHV_IMPORT_ISOLATED_PAGES()
+        )?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            MSHV_COMPLETE_ISOLATED_IMPORT()
+        )?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_READ_GPA())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_WRITE_GPA())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_SEV_SNP_AP_CREATE())?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            MSHV_ISSUE_PSP_GUEST_REQUEST()
+        )?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_ROOT_HVCALL())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_ASSERT_INTERRUPT())?],
+    ])
+}
+
+#[cfg(feature = "kvm")]
+fn create_vmm_ioctl_seccomp_rule_common_kvm() -> Result<Vec<SeccompRule>, BackendError> {
+    Ok(or![
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_CHECK_EXTENSION)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_CREATE_DEVICE,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_CREATE_IRQCHIP,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_CREATE_VCPU)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_CREATE_VM)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_ENABLE_CAP)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_API_VERSION,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_DEVICE_ATTR,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_DIRTY_LOG)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_MP_STATE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_ONE_REG)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_REGS)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_REG_LIST)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_SUPPORTED_CPUID,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_VCPU_EVENTS,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_VCPU_MMAP_SIZE,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_IOEVENTFD)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_IRQFD)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_RUN)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_MEMORY_ENCRYPT_OP)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_DEVICE_ATTR,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_HAS_DEVICE_ATTR,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_GSI_ROUTING)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_MP_STATE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_ONE_REG)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_REGS)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_USER_MEMORY_REGION,)?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            KVM_SET_USER_MEMORY_REGION2,
+        )?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_MEMORY_ATTRIBUTES,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_CREATE_GUEST_MEMFD,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_VCPU_EVENTS,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_NMI)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_NESTED_STATE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_NESTED_STATE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SEV_SNP_LAUNCH_START)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SEV_SNP_LAUNCH_UPDATE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SEV_SNP_LAUNCH_FINISH)?],
+    ])
+}
+
+fn create_vmm_ioctl_seccomp_rule_iommufd() -> Result<Vec<SeccompRule>, BackendError> {
+    use iommufd::*;
+    Ok(or![
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_DESTROY)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_ALLOC)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_MAP)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_UNMAP)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_DEVICE_BIND_IOMMUFD)?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            VFIO_DEVICE_ATTACH_IOMMUFD_PT
+        )?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            VFIO_DEVICE_DETACH_IOMMUFD_PT
+        )?],
+    ])
+}
+
+fn create_vmm_ioctl_seccomp_rule_hypervisor(
+    hypervisor_type: HypervisorType,
+) -> Result<Vec<SeccompRule>, BackendError> {
+    match hypervisor_type {
+        #[cfg(feature = "kvm")]
+        HypervisorType::Kvm => create_vmm_ioctl_seccomp_rule_common_kvm(),
+        #[cfg(feature = "mshv")]
+        HypervisorType::Mshv => create_vmm_ioctl_seccomp_rule_common_mshv(),
+    }
+}
+
+fn create_vmm_ioctl_seccomp_rule_common(
+    hypervisor_type: HypervisorType,
+) -> Result<Vec<SeccompRule>, BackendError> {
+    let mut common_rules = or![
+        and![Cond::new(1, ArgLen::Dword, Eq, BLKSSZGET as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, BLKPBSZGET as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, BLKIOMIN as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, BLKIOOPT as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, BLKGETSIZE64 as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, BLKDISCARD as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, BLKZEROOUT as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, FIOCLEX as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, FIONBIO as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, SIOCGIFFLAGS)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, SIOCGIFHWADDR)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, SIOCGIFMTU)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, SIOCGIFINDEX)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, SIOCSIFADDR)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, SIOCSIFFLAGS)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, SIOCSIFHWADDR)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, SIOCSIFMTU)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, SIOCSIFNETMASK)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TCSETS as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TCSETS2 as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TCGETS as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TCGETS2 as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TIOCGPGRP as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TIOCGPTPEER as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TIOCGWINSZ as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TIOCSCTTY as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TIOCSPGRP as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TIOCSPTLCK as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TUNGETFEATURES as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TUNGETIFF as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TUNSETIFF as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TUNSETOFFLOAD as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TUNSETVNETHDRSZ as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_GET_API_VERSION)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_CHECK_EXTENSION)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_SET_IOMMU)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_GROUP_GET_STATUS)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_GROUP_SET_CONTAINER)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_GROUP_UNSET_CONTAINER)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_GROUP_GET_DEVICE_FD)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_DEVICE_GET_INFO)?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            VFIO_DEVICE_GET_REGION_INFO
+        )?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_DEVICE_GET_IRQ_INFO)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_DEVICE_SET_IRQS)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_DEVICE_RESET)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_IOMMU_MAP_DMA)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_IOMMU_UNMAP_DMA)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_DEVICE_IOEVENTFD)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_DEVICE_FEATURE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VHOST_GET_FEATURES())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VHOST_SET_FEATURES())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VHOST_SET_OWNER())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VHOST_SET_VRING_NUM())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VHOST_SET_VRING_ADDR())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VHOST_SET_VRING_BASE())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VHOST_SET_VRING_KICK())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VHOST_SET_VRING_CALL())?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            VHOST_SET_BACKEND_FEATURES()
+        )?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            VHOST_GET_BACKEND_FEATURES()
+        )?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VHOST_VDPA_GET_DEVICE_ID())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VHOST_VDPA_GET_STATUS())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VHOST_VDPA_SET_STATUS())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VHOST_VDPA_GET_CONFIG())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VHOST_VDPA_SET_CONFIG())?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            VHOST_VDPA_SET_VRING_ENABLE(),
+        )?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VHOST_VDPA_GET_VRING_NUM())?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            VHOST_VDPA_SET_CONFIG_CALL()
+        )?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            VHOST_VDPA_GET_IOVA_RANGE()
+        )?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            VHOST_VDPA_GET_CONFIG_SIZE()
+        )?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VHOST_VDPA_SUSPEND())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_API)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_COPY)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_REGISTER)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_WAKE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_CONTINUE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, USERFAULTFD_IOC_NEW)?],
+    ];
+
+    let hypervisor_rules = create_vmm_ioctl_seccomp_rule_hypervisor(hypervisor_type)?;
+    common_rules.extend(hypervisor_rules);
+
+    let iommufd_rules = create_vmm_ioctl_seccomp_rule_iommufd()?;
+    common_rules.extend(iommufd_rules);
+
+    Ok(common_rules)
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "kvm"))]
+fn create_vmm_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError> {
+    const KVM_CREATE_PIT2: u64 = 0x4040_ae77;
+    const KVM_GET_CLOCK: u64 = 0x8030_ae7c;
+    const KVM_GET_CPUID2: u64 = 0xc008_ae91;
+    const KVM_GET_FPU: u64 = 0x81a0_ae8c;
+    const KVM_GET_LAPIC: u64 = 0x8400_ae8e;
+    const KVM_GET_MSR_INDEX_LIST: u64 = 0xc004_ae02;
+    const KVM_GET_MSR_FEATURE_INDEX_LIST: u64 = 0xc004_ae0a;
+    const KVM_GET_MSRS: u64 = 0xc008_ae88;
+    const KVM_GET_SREGS: u64 = 0x8138_ae83;
+    const KVM_GET_TSC_KHZ: u64 = 0xaea3;
+    const KVM_GET_XCRS: u64 = 0x8188_aea6;
+    const KVM_GET_XSAVE: u64 = 0x9000_aea4;
+    const KVM_GET_XSAVE2: u64 = 0x9000_aecf;
+    const KVM_KVMCLOCK_CTRL: u64 = 0xaead;
+    const KVM_SET_CLOCK: u64 = 0x4030_ae7b;
+    const KVM_SET_CPUID2: u64 = 0x4008_ae90;
+    const KVM_SET_FPU: u64 = 0x41a0_ae8d;
+    const KVM_SET_IDENTITY_MAP_ADDR: u64 = 0x4008_ae48;
+    const KVM_SET_LAPIC: u64 = 0x4400_ae8f;
+    const KVM_SET_MSRS: u64 = 0x4008_ae89;
+    const KVM_SET_SREGS: u64 = 0x4138_ae84;
+    const KVM_SET_TSC_KHZ: u64 = 0xaea2;
+    const KVM_SET_TSS_ADDR: u64 = 0xae47;
+    const KVM_SET_XCRS: u64 = 0x4188_aea7;
+    const KVM_SET_XSAVE: u64 = 0x5000_aea5;
+    const KVM_SET_GUEST_DEBUG: u64 = 0x4048_ae9b;
+    const KVM_TRANSLATE: u64 = 0xc018_ae85;
+
+    let common_rules = create_vmm_ioctl_seccomp_rule_common(HypervisorType::Kvm)?;
+    let mut arch_rules = or![
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_CREATE_PIT2)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_CLOCK,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_CPUID2,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_FPU)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_LAPIC)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_MSR_INDEX_LIST)?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            KVM_GET_MSR_FEATURE_INDEX_LIST
+        )?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_MSRS)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_SREGS)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_TSC_KHZ)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_XCRS,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_XSAVE,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_XSAVE2,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_KVMCLOCK_CTRL)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_CLOCK)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_CPUID2)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_FPU)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_IDENTITY_MAP_ADDR)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_LAPIC)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_SREGS)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_TSC_KHZ)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_TSS_ADDR,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_MSRS)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_XCRS,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_XSAVE,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_GUEST_DEBUG,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_TRANSLATE,)?],
+    ];
+    arch_rules.extend(common_rules);
+
+    Ok(arch_rules)
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "kvm"))]
+fn create_vmm_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError> {
+    const KVM_ARM_PREFERRED_TARGET: u64 = 0x8020_aeaf;
+    const KVM_ARM_VCPU_INIT: u64 = 0x4020_aeae;
+    const KVM_SET_GUEST_DEBUG: u64 = 0x4208_ae9b;
+    const KVM_ARM_VCPU_FINALIZE: u64 = 0x4004_aec2;
+
+    let common_rules = create_vmm_ioctl_seccomp_rule_common(HypervisorType::Kvm)?;
+    let mut arch_rules = or![
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_ARM_PREFERRED_TARGET,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_ARM_VCPU_INIT,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_GUEST_DEBUG,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_ARM_VCPU_FINALIZE,)?],
+    ];
+    arch_rules.extend(common_rules);
+
+    Ok(arch_rules)
+}
+
+#[cfg(all(target_arch = "riscv64", feature = "kvm"))]
+fn create_vmm_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError> {
+    let common_rules = create_vmm_ioctl_seccomp_rule_common(HypervisorType::Kvm)?;
+    Ok(common_rules)
+}
+
+#[cfg(feature = "mshv")]
+fn create_vmm_ioctl_seccomp_rule_mshv() -> Result<Vec<SeccompRule>, BackendError> {
+    create_vmm_ioctl_seccomp_rule_common(HypervisorType::Mshv)
+}
+
+fn create_vmm_ioctl_seccomp_rule(
+    hypervisor_type: HypervisorType,
+) -> Result<Vec<SeccompRule>, BackendError> {
+    match hypervisor_type {
+        #[cfg(feature = "kvm")]
+        HypervisorType::Kvm => create_vmm_ioctl_seccomp_rule_kvm(),
+        #[cfg(feature = "mshv")]
+        HypervisorType::Mshv => create_vmm_ioctl_seccomp_rule_mshv(),
+    }
+}
+
+fn create_api_ioctl_seccomp_rule() -> Result<Vec<SeccompRule>, BackendError> {
+    Ok(or![and![Cond::new(1, ArgLen::Dword, Eq, FIONBIO as _)?]])
+}
+
+fn create_serial_manager_ioctl_seccomp_rule() -> Result<Vec<SeccompRule>, BackendError> {
+    Ok(or![and![Cond::new(1, ArgLen::Dword, Eq, FIONBIO as _)?]])
+}
+
+// Syscalls needed by all threads, because they are used in the seccomp signal
+// handler.
+fn common_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
+    Ok(vec![
+        (libc::SYS_getpid, vec![]),
+        (libc::SYS_gettid, vec![]),
+        (libc::SYS_read, vec![]),
+        (libc::SYS_rt_sigaction, vec![]),
+        (libc::SYS_rt_sigprocmask, vec![]),
+        (libc::SYS_tgkill, vec![]),
+        (libc::SYS_tkill, vec![]),
+        (libc::SYS_write, vec![]),
+    ])
+}
+
+fn create_signal_handler_ioctl_seccomp_rule() -> Result<Vec<SeccompRule>, BackendError> {
+    Ok(or![
+        and![Cond::new(1, ArgLen::Dword, Eq, TCGETS as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TCGETS2 as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TCSETS as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TCSETS2 as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TIOCGWINSZ as _)?],
+    ])
+}
+
+fn signal_handler_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
+    Ok(vec![
+        (libc::SYS_brk, vec![]),
+        (libc::SYS_close, vec![]),
+        (libc::SYS_exit, vec![]),
+        (libc::SYS_exit_group, vec![]),
+        (libc::SYS_fcntl, vec![]),
+        (libc::SYS_futex, vec![]),
+        (libc::SYS_ioctl, create_signal_handler_ioctl_seccomp_rule()?),
+        (libc::SYS_landlock_create_ruleset, vec![]),
+        (libc::SYS_landlock_restrict_self, vec![]),
+        (libc::SYS_madvise, vec![]),
+        (libc::SYS_mmap, vec![]),
+        (libc::SYS_munmap, vec![]),
+        (libc::SYS_prctl, vec![]),
+        (libc::SYS_recvfrom, vec![]),
+        (libc::SYS_rt_sigreturn, vec![]),
+        (libc::SYS_sched_yield, vec![]),
+        (libc::SYS_sendto, vec![]),
+        (libc::SYS_sigaltstack, vec![]),
+    ])
+}
+
+fn create_pty_foreground_ioctl_seccomp_rule() -> Result<Vec<SeccompRule>, BackendError> {
+    Ok(or![
+        and![Cond::new(1, ArgLen::Dword, Eq, TIOCGPGRP as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TIOCSCTTY as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TIOCSPGRP as _)?],
+    ])
+}
+
+fn pty_foreground_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
+    Ok(vec![
+        (libc::SYS_close, vec![]),
+        (libc::SYS_exit_group, vec![]),
+        (libc::SYS_fcntl, vec![]),
+        (libc::SYS_getcwd, vec![]),
+        (libc::SYS_getpgid, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_getpgrp, vec![]),
+        (libc::SYS_ioctl, create_pty_foreground_ioctl_seccomp_rule()?),
+        (libc::SYS_munmap, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_poll, vec![]),
+        #[cfg(target_arch = "aarch64")]
+        (libc::SYS_ppoll, vec![]),
+        (libc::SYS_restart_syscall, vec![]),
+        (libc::SYS_rt_sigreturn, vec![]),
+        (libc::SYS_sched_yield, vec![]),
+        (libc::SYS_setsid, vec![]),
+        (libc::SYS_sigaltstack, vec![]),
+    ])
+}
+
+// The filter containing the white listed syscall rules required by the VMM to
+// function.
+fn vmm_thread_rules(
+    hypervisor_type: HypervisorType,
+) -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
+    Ok(vec![
+        (libc::SYS_accept4, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_access, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_arch_prctl, vec![]),
+        (libc::SYS_bind, vec![]),
+        (libc::SYS_brk, vec![]),
+        (libc::SYS_clock_gettime, vec![]),
+        (libc::SYS_clock_nanosleep, vec![]),
+        (libc::SYS_clone, vec![]),
+        (libc::SYS_clone3, vec![]),
+        (libc::SYS_close, vec![]),
+        (libc::SYS_close_range, vec![]),
+        (libc::SYS_connect, vec![]),
+        (libc::SYS_dup, vec![]),
+        (libc::SYS_epoll_create1, vec![]),
+        (libc::SYS_epoll_ctl, vec![]),
+        (libc::SYS_epoll_pwait, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_epoll_wait, vec![]),
+        (libc::SYS_eventfd2, vec![]),
+        (libc::SYS_exit, vec![]),
+        (libc::SYS_exit_group, vec![]),
+        (libc::SYS_fallocate, vec![]),
+        (libc::SYS_fcntl, vec![]),
+        (libc::SYS_fdatasync, vec![]),
+        (libc::SYS_fstat, vec![]),
+        (libc::SYS_fsync, vec![]),
+        (libc::SYS_ftruncate, vec![]),
+        #[cfg(target_arch = "aarch64")]
+        (libc::SYS_faccessat, vec![]),
+        #[cfg(target_arch = "aarch64")]
+        (libc::SYS_newfstatat, vec![]),
+        (libc::SYS_futex, vec![]),
+        (libc::SYS_getcwd, vec![]),
+        (libc::SYS_getdents64, vec![]),
+        (libc::SYS_getpgid, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_getpgrp, vec![]),
+        (libc::SYS_getrandom, vec![]),
+        (libc::SYS_getsockname, vec![]),
+        (libc::SYS_gettimeofday, vec![]),
+        (libc::SYS_getuid, vec![]),
+        (
+            libc::SYS_ioctl,
+            create_vmm_ioctl_seccomp_rule(hypervisor_type)?,
+        ),
+        (libc::SYS_io_cancel, vec![]),
+        (libc::SYS_io_destroy, vec![]),
+        (libc::SYS_io_getevents, vec![]),
+        (libc::SYS_io_setup, vec![]),
+        (libc::SYS_io_submit, vec![]),
+        (libc::SYS_io_uring_enter, vec![]),
+        (libc::SYS_io_uring_setup, vec![]),
+        (libc::SYS_io_uring_register, vec![]),
+        (libc::SYS_kill, vec![]),
+        (libc::SYS_landlock_create_ruleset, vec![]),
+        (libc::SYS_landlock_add_rule, vec![]),
+        (libc::SYS_landlock_restrict_self, vec![]),
+        (libc::SYS_listen, vec![]),
+        (libc::SYS_lseek, vec![]),
+        (libc::SYS_madvise, vec![]),
+        (libc::SYS_mbind, vec![]),
+        (libc::SYS_memfd_create, vec![]),
+        (libc::SYS_mmap, vec![]),
+        (libc::SYS_mprotect, vec![]),
+        (libc::SYS_mremap, vec![]),
+        (libc::SYS_munmap, vec![]),
+        (libc::SYS_nanosleep, vec![]),
+        (libc::SYS_newfstatat, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_open, vec![]),
+        (libc::SYS_openat, vec![]),
+        (libc::SYS_openat2, vec![]),
+        (libc::SYS_pipe2, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_poll, vec![]),
+        #[cfg(target_arch = "aarch64")]
+        (libc::SYS_ppoll, vec![]),
+        (libc::SYS_prctl, vec![]),
+        (libc::SYS_pread64, vec![]),
+        (libc::SYS_preadv, vec![]),
+        (libc::SYS_prlimit64, vec![]),
+        (libc::SYS_pwrite64, vec![]),
+        (libc::SYS_pwritev, vec![]),
+        (libc::SYS_pwritev2, vec![]),
+        (libc::SYS_readv, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_readlink, vec![]),
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        (libc::SYS_readlinkat, vec![]),
+        (libc::SYS_recvfrom, vec![]),
+        (libc::SYS_recvmsg, vec![]),
+        (libc::SYS_restart_syscall, vec![]),
+        (libc::SYS_rseq, vec![]),
+        (libc::SYS_rt_sigreturn, vec![]),
+        (libc::SYS_sched_getaffinity, vec![]),
+        (libc::SYS_sched_setaffinity, vec![]),
+        (libc::SYS_sched_yield, vec![]),
+        (libc::SYS_seccomp, vec![]),
+        (libc::SYS_sendmsg, vec![]),
+        (libc::SYS_sendto, vec![]),
+        (libc::SYS_set_robust_list, vec![]),
+        (libc::SYS_setsid, vec![]),
+        (libc::SYS_setsockopt, vec![]),
+        (libc::SYS_shutdown, vec![]),
+        (libc::SYS_sigaltstack, vec![]),
+        (
+            libc::SYS_socket,
+            or![
+                and![Cond::new(0, ArgLen::Dword, Eq, libc::AF_UNIX as u64)?],
+                and![Cond::new(0, ArgLen::Dword, Eq, libc::AF_INET as u64)?],
+                and![Cond::new(0, ArgLen::Dword, Eq, libc::AF_INET6 as u64)?],
+                and![Cond::new(0, ArgLen::Dword, Eq, libc::AF_NETLINK as u64)?],
+            ],
+        ),
+        (libc::SYS_socketpair, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_stat, vec![]),
+        (libc::SYS_statfs, vec![]),
+        (libc::SYS_statx, vec![]),
+        (libc::SYS_timerfd_create, vec![]),
+        (libc::SYS_timerfd_settime, vec![]),
+        (
+            libc::SYS_umask,
+            or![and![Cond::new(0, ArgLen::Dword, Eq, 0o077)?]],
+        ),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_unlink, vec![]),
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        (libc::SYS_unlinkat, vec![]),
+        (libc::SYS_userfaultfd, vec![]),
+        (libc::SYS_wait4, vec![]),
+        (libc::SYS_writev, vec![]),
+    ])
+}
+
+#[cfg(feature = "kvm")]
+fn create_vcpu_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError> {
+    Ok(or![
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_CHECK_EXTENSION,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_IOEVENTFD)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_IRQFD,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_DEVICE_ATTR,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_GSI_ROUTING,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_USER_MEMORY_REGION,)?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            KVM_SET_USER_MEMORY_REGION2,
+        )?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_CREATE_GUEST_MEMFD,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_MEMORY_ATTRIBUTES,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_RUN,)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_NMI)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_NESTED_STATE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_NESTED_STATE)?],
+    ])
+}
+
+#[cfg(feature = "mshv")]
+fn create_vcpu_ioctl_seccomp_rule_mshv() -> Result<Vec<SeccompRule>, BackendError> {
+    Ok(or![
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_SET_MSI_ROUTING())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_IOEVENTFD())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_IRQFD())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_RUN_VP())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_GET_VP_REGISTERS())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_SET_VP_REGISTERS())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_SET_GUEST_MEMORY())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_VP_TRANSLATE_GVA())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_GET_VP_CPUID_VALUES())?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            MSHV_MODIFY_GPA_HOST_ACCESS()
+        )?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_READ_GPA())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_WRITE_GPA())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_SEV_SNP_AP_CREATE())?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            MSHV_ISSUE_PSP_GUEST_REQUEST()
+        )?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_ROOT_HVCALL())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_ASSERT_INTERRUPT())?],
+    ])
+}
+
+fn create_vcpu_ioctl_seccomp_rule_hypervisor(
+    hypervisor_type: HypervisorType,
+) -> Result<Vec<SeccompRule>, BackendError> {
+    match hypervisor_type {
+        #[cfg(feature = "kvm")]
+        HypervisorType::Kvm => create_vcpu_ioctl_seccomp_rule_kvm(),
+        #[cfg(feature = "mshv")]
+        HypervisorType::Mshv => create_vcpu_ioctl_seccomp_rule_mshv(),
+    }
+}
+
+fn create_vcpu_ioctl_seccomp_rule_iommufd() -> Result<Vec<SeccompRule>, BackendError> {
+    use iommufd::*;
+    Ok(or![
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_DESTROY)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_MAP)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_UNMAP)?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            VFIO_DEVICE_DETACH_IOMMUFD_PT
+        )?],
+    ])
+}
+
+fn create_vcpu_ioctl_seccomp_rule(
+    hypervisor_type: HypervisorType,
+) -> Result<Vec<SeccompRule>, BackendError> {
+    let mut rules = or![
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_DEVICE_SET_IRQS)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_GROUP_UNSET_CONTAINER)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_IOMMU_MAP_DMA)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_IOMMU_UNMAP_DMA)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VHOST_VDPA_SET_STATUS())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VHOST_VDPA_GET_CONFIG())?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VHOST_VDPA_SET_CONFIG())?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            VHOST_VDPA_SET_VRING_ENABLE(),
+        )?],
+    ];
+
+    let hypervisor_rules = create_vcpu_ioctl_seccomp_rule_hypervisor(hypervisor_type)?;
+    rules.extend(hypervisor_rules);
+
+    let iommufd_rules = create_vcpu_ioctl_seccomp_rule_iommufd()?;
+    rules.extend(iommufd_rules);
+
+    Ok(rules)
+}
+
+fn vcpu_thread_rules(
+    hypervisor_type: HypervisorType,
+) -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
+    Ok(vec![
+        (libc::SYS_brk, vec![]),
+        (libc::SYS_clock_gettime, vec![]),
+        (libc::SYS_clock_nanosleep, vec![]),
+        (libc::SYS_close, vec![]),
+        (libc::SYS_dup, vec![]),
+        (libc::SYS_exit, vec![]),
+        (libc::SYS_epoll_ctl, vec![]),
+        (
+            libc::SYS_fallocate,
+            or![and![Cond::new(
+                1,
+                ArgLen::Dword,
+                Eq,
+                (libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE) as u64,
+            )?]],
+        ),
+        (libc::SYS_fcntl, vec![]),
+        (libc::SYS_fstat, vec![]),
+        (libc::SYS_fsync, vec![]),
+        (libc::SYS_futex, vec![]),
+        (libc::SYS_getcwd, vec![]),
+        (libc::SYS_getrandom, vec![]),
+        (
+            libc::SYS_ioctl,
+            create_vcpu_ioctl_seccomp_rule(hypervisor_type)?,
+        ),
+        (libc::SYS_lseek, vec![]),
+        (libc::SYS_madvise, vec![]),
+        (libc::SYS_mmap, vec![]),
+        (libc::SYS_mprotect, vec![]),
+        (libc::SYS_mremap, vec![]),
+        (libc::SYS_munmap, vec![]),
+        (libc::SYS_nanosleep, vec![]),
+        (libc::SYS_newfstatat, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_open, vec![]),
+        (libc::SYS_pread64, vec![]),
+        (libc::SYS_pwrite64, vec![]),
+        (libc::SYS_pwritev2, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_readlink, vec![]),
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        (libc::SYS_readlinkat, vec![]),
+        (libc::SYS_recvfrom, vec![]),
+        (libc::SYS_recvmsg, vec![]),
+        (libc::SYS_rt_sigreturn, vec![]),
+        (libc::SYS_sched_yield, vec![]),
+        (libc::SYS_sendmsg, vec![]),
+        (libc::SYS_sendto, vec![]),
+        (libc::SYS_shutdown, vec![]),
+        (libc::SYS_sigaltstack, vec![]),
+        (libc::SYS_statx, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_unlink, vec![]),
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        (libc::SYS_unlinkat, vec![]),
+        (libc::SYS_writev, vec![]),
+    ])
+}
+
+// The filter containing the white listed syscall rules required by the HTTP API to
+// function.
+fn http_api_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
+    Ok(vec![
+        (libc::SYS_accept4, vec![]),
+        (libc::SYS_brk, vec![]),
+        (libc::SYS_clock_gettime, vec![]),
+        (libc::SYS_close, vec![]),
+        (libc::SYS_dup, vec![]),
+        (libc::SYS_epoll_create1, vec![]),
+        (libc::SYS_epoll_ctl, vec![]),
+        (libc::SYS_epoll_pwait, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_epoll_wait, vec![]),
+        (libc::SYS_exit, vec![]),
+        (libc::SYS_fcntl, vec![]),
+        (libc::SYS_getcwd, vec![]),
+        (libc::SYS_futex, vec![]),
+        (libc::SYS_getrandom, vec![]),
+        (libc::SYS_ioctl, create_api_ioctl_seccomp_rule()?),
+        (libc::SYS_landlock_create_ruleset, vec![]),
+        (libc::SYS_landlock_restrict_self, vec![]),
+        (libc::SYS_madvise, vec![]),
+        (libc::SYS_mmap, vec![]),
+        (libc::SYS_mprotect, vec![]),
+        (libc::SYS_munmap, vec![]),
+        (libc::SYS_prctl, vec![]),
+        (libc::SYS_recvfrom, vec![]),
+        (libc::SYS_recvmsg, vec![]),
+        (libc::SYS_sched_yield, vec![]),
+        (libc::SYS_sendto, vec![]),
+        (libc::SYS_sigaltstack, vec![]),
+    ])
+}
+
+// The filter containing the white listed syscall rules required by the D-Bus API
+// to function.
+#[cfg(feature = "dbus_api")]
+fn dbus_api_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
+    Ok(vec![
+        (libc::SYS_brk, vec![]),
+        (libc::SYS_clock_gettime, vec![]),
+        (libc::SYS_clone, vec![]),
+        (libc::SYS_clone3, vec![]),
+        (libc::SYS_close, vec![]),
+        (libc::SYS_dup, vec![]),
+        (libc::SYS_epoll_ctl, vec![]),
+        (libc::SYS_exit, vec![]),
+        (libc::SYS_fcntl, vec![]),
+        (libc::SYS_futex, vec![]),
+        (libc::SYS_getcwd, vec![]),
+        (libc::SYS_getrandom, vec![]),
+        (libc::SYS_madvise, vec![]),
+        (libc::SYS_mmap, vec![]),
+        (libc::SYS_mprotect, vec![]),
+        (libc::SYS_munmap, vec![]),
+        (libc::SYS_prctl, vec![]),
+        (libc::SYS_recvmsg, vec![]),
+        (libc::SYS_rseq, vec![]),
+        (libc::SYS_sched_getaffinity, vec![]),
+        (libc::SYS_sched_yield, vec![]),
+        (libc::SYS_sendmsg, vec![]),
+        (libc::SYS_set_robust_list, vec![]),
+        (libc::SYS_sigaltstack, vec![]),
+    ])
+}
+
+fn event_monitor_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
+    Ok(vec![
+        (libc::SYS_brk, vec![]),
+        (libc::SYS_close, vec![]),
+        (libc::SYS_getcwd, vec![]),
+        (libc::SYS_futex, vec![]),
+        (libc::SYS_landlock_create_ruleset, vec![]),
+        (libc::SYS_landlock_restrict_self, vec![]),
+        (libc::SYS_madvise, vec![]),
+        (libc::SYS_mmap, vec![]),
+        (libc::SYS_munmap, vec![]),
+        (libc::SYS_prctl, vec![]),
+        (libc::SYS_sched_yield, vec![]),
+    ])
+}
+
+fn migration_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
+    Ok(vec![
+        (libc::SYS_accept4, vec![]),
+        (libc::SYS_bind, vec![]),
+        (libc::SYS_brk, vec![]),
+        (libc::SYS_clock_gettime, vec![]),
+        (libc::SYS_clock_nanosleep, vec![]),
+        (libc::SYS_clone, vec![]),
+        (libc::SYS_clone3, vec![]),
+        (libc::SYS_close, vec![]),
+        (libc::SYS_connect, vec![]),
+        (libc::SYS_exit, vec![]),
+        (libc::SYS_exit_group, vec![]),
+        (libc::SYS_fcntl, vec![]),
+        (libc::SYS_fstat, vec![]),
+        (libc::SYS_ftruncate, vec![]),
+        (libc::SYS_futex, vec![]),
+        (libc::SYS_getrandom, vec![]),
+        (libc::SYS_getsockname, vec![]),
+        (libc::SYS_ioctl, vec![]),
+        (libc::SYS_lseek, vec![]),
+        (libc::SYS_madvise, vec![]),
+        (libc::SYS_memfd_create, vec![]),
+        (libc::SYS_mmap, vec![]),
+        (libc::SYS_mprotect, vec![]),
+        (libc::SYS_mremap, vec![]),
+        (libc::SYS_munmap, vec![]),
+        (libc::SYS_nanosleep, vec![]),
+        (libc::SYS_openat, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_poll, vec![]),
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        (libc::SYS_ppoll, vec![]),
+        (libc::SYS_prctl, vec![]),
+        (libc::SYS_readv, vec![]),
+        (libc::SYS_recvfrom, vec![]),
+        (libc::SYS_recvmsg, vec![]),
+        (libc::SYS_rseq, vec![]),
+        (libc::SYS_rt_sigreturn, vec![]),
+        (libc::SYS_sched_getaffinity, vec![]),
+        (libc::SYS_sched_yield, vec![]),
+        (libc::SYS_seccomp, vec![]),
+        (libc::SYS_sendmsg, vec![]),
+        (libc::SYS_setsockopt, vec![]),
+        (libc::SYS_sendto, vec![]),
+        (libc::SYS_set_robust_list, vec![]),
+        (libc::SYS_sigaltstack, vec![]),
+        (libc::SYS_socket, vec![]),
+        (libc::SYS_socketpair, vec![]),
+        (libc::SYS_statx, vec![]),
+        (libc::SYS_timerfd_settime, vec![]),
+        (libc::SYS_writev, vec![]),
+    ])
+}
+
+fn migration_tcp_worker_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
+    Ok(vec![
+        (libc::SYS_accept4, vec![]),
+        (libc::SYS_brk, vec![]),
+        (libc::SYS_clock_gettime, vec![]),
+        (libc::SYS_clone, vec![]),
+        (libc::SYS_clone3, vec![]),
+        (libc::SYS_close, vec![]),
+        (libc::SYS_exit, vec![]),
+        (libc::SYS_exit_group, vec![]),
+        (libc::SYS_fcntl, vec![]),
+        (libc::SYS_futex, vec![]),
+        (libc::SYS_getrandom, vec![]),
+        (libc::SYS_madvise, vec![]),
+        (libc::SYS_mmap, vec![]),
+        (libc::SYS_mprotect, vec![]),
+        (libc::SYS_munmap, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_poll, vec![]),
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        (libc::SYS_ppoll, vec![]),
+        (libc::SYS_prctl, vec![]),
+        (libc::SYS_pwrite64, vec![]),
+        (libc::SYS_readv, vec![]),
+        (libc::SYS_recvfrom, vec![]),
+        (libc::SYS_recvmsg, vec![]),
+        (libc::SYS_rseq, vec![]),
+        (libc::SYS_rt_sigreturn, vec![]),
+        (libc::SYS_sched_getaffinity, vec![]),
+        (libc::SYS_sched_yield, vec![]),
+        // We are already inheriting seccomp from the parent thread.
+        (libc::SYS_seccomp, vec![]),
+        (libc::SYS_sendmsg, vec![]),
+        (libc::SYS_sendto, vec![]),
+        (libc::SYS_set_robust_list, vec![]),
+        (libc::SYS_setsockopt, vec![]),
+        (libc::SYS_sigaltstack, vec![]),
+        (libc::SYS_writev, vec![]),
+    ])
+}
+
+fn serial_manager_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
+    Ok(vec![
+        (libc::SYS_accept4, vec![]),
+        (libc::SYS_clock_nanosleep, vec![]),
+        (libc::SYS_clock_gettime, vec![]),
+        (libc::SYS_close, vec![]),
+        (libc::SYS_epoll_ctl, vec![]),
+        (libc::SYS_epoll_pwait, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_epoll_wait, vec![]),
+        (libc::SYS_exit, vec![]),
+        (libc::SYS_fcntl, vec![]),
+        (libc::SYS_futex, vec![]),
+        (libc::SYS_ioctl, create_serial_manager_ioctl_seccomp_rule()?),
+        (libc::SYS_madvise, vec![]),
+        (libc::SYS_mmap, vec![]),
+        (libc::SYS_munmap, vec![]),
+        (libc::SYS_nanosleep, vec![]),
+        (libc::SYS_recvfrom, vec![]),
+        (libc::SYS_rt_sigreturn, vec![]),
+        (libc::SYS_sendto, vec![]),
+        (libc::SYS_shutdown, vec![]),
+        (libc::SYS_sigaltstack, vec![]),
+    ])
+}
+
+// The filter containing the white listed syscall rules required by the
+// migration postcopy thread.
+fn migrate_send_postcopy_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
+    Ok(vec![
+        (libc::SYS_brk, vec![]),
+        (libc::SYS_clock_gettime, vec![]),
+        (libc::SYS_close, vec![]),
+        (libc::SYS_exit, vec![]),
+        (libc::SYS_futex, vec![]),
+        (libc::SYS_getrandom, vec![]),
+        (libc::SYS_madvise, vec![]),
+        (libc::SYS_mmap, vec![]),
+        (libc::SYS_mprotect, vec![]),
+        (libc::SYS_munmap, vec![]),
+        (libc::SYS_recvfrom, vec![]),
+        (libc::SYS_recvmsg, vec![]),
+        (libc::SYS_rt_sigreturn, vec![]),
+        (libc::SYS_sched_yield, vec![]),
+        (libc::SYS_sendmsg, vec![]),
+        (libc::SYS_sendto, vec![]),
+        (libc::SYS_sigaltstack, vec![]),
+        (libc::SYS_writev, vec![]),
+    ])
+}
+
+fn get_seccomp_rules(
+    thread_type: Thread,
+    hypervisor_type: Option<HypervisorType>,
+) -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
+    let mut rules = common_thread_rules()?;
+    let specific_rules = match thread_type {
+        Thread::HttpApi => http_api_thread_rules()?,
+        #[cfg(feature = "dbus_api")]
+        Thread::DBusApi => dbus_api_thread_rules()?,
+        Thread::EventMonitor => event_monitor_thread_rules()?,
+        Thread::MigrationWorker => migration_thread_rules()?,
+        Thread::MigrationTcpWorker => migration_tcp_worker_thread_rules()?,
+        Thread::SerialManager => serial_manager_thread_rules()?,
+        Thread::SignalHandler => signal_handler_thread_rules()?,
+        Thread::Vcpu => vcpu_thread_rules(
+            hypervisor_type.expect("hypervisor_type is required for Vcpu threads"),
+        )?,
+        Thread::Vmm => {
+            vmm_thread_rules(hypervisor_type.expect("hypervisor_type is required for Vmm threads"))?
+        }
+        Thread::PtyForeground => pty_foreground_thread_rules()?,
+        Thread::MigrateSendPostcopy => migrate_send_postcopy_thread_rules()?,
+    };
+    if !rules
+        .iter()
+        .chain(specific_rules.iter())
+        .any(|(syscall, _)| *syscall == libc::SYS_openat)
+    {
+        rules.push((
+            libc::SYS_openat,
+            or![and![Cond::new(
+                2, // openat() flags argument
+                ArgLen::Dword,
+                MaskedEq(libc::O_ACCMODE as u64),
+                libc::O_RDONLY as u64,
+            )?]],
+        ));
+    }
+    if !rules
+        .iter()
+        .chain(specific_rules.iter())
+        .any(|(syscall, _)| *syscall == libc::SYS_prctl)
+    {
+        rules.push((
+            libc::SYS_prctl,
+            or![and![Cond::new(
+                0, // prctl() option argument
+                ArgLen::Dword,
+                Eq,
+                libc::PR_GET_NAME as u64,
+            )?]],
+        ));
+    }
+    rules.extend(specific_rules);
+    Ok(rules)
+}
+
+/// Generate a BPF program based on the seccomp_action value
+pub fn get_seccomp_filter(
+    seccomp_action: &SeccompAction,
+    thread_type: Thread,
+    hypervisor_type: Option<HypervisorType>,
+) -> Result<BpfProgram, Error> {
+    match seccomp_action {
+        SeccompAction::Allow => Ok(vec![]),
+        _ => SeccompFilter::new(
+            get_seccomp_rules(thread_type, hypervisor_type)
+                .map_err(Error::Backend)?
+                .into_iter()
+                .collect(),
+            seccomp_action.clone(),
+            SeccompAction::Allow,
+            consts::ARCH.try_into().unwrap(),
+        )
+        .and_then(|filter| filter.try_into())
+        .map_err(Error::Backend),
+    }
+}

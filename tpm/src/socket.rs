@@ -1,0 +1,180 @@
+// Copyright © 2022, Microsoft Corporation
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+use std::io::{ErrorKind, Read};
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::net::UnixStream;
+use std::path::Path;
+
+use anyhow::anyhow;
+use log::debug;
+use thiserror::Error;
+use vmm_sys_util::sock_ctrl_msg::ScmSocket;
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("Cannot connect to tpm Socket")]
+    ConnectToSocket(#[source] anyhow::Error),
+    #[error("Failed to read from socket")]
+    ReadFromSocket(#[source] anyhow::Error),
+    #[error("Failed to write to socket")]
+    WriteToSocket(#[source] anyhow::Error),
+}
+type Result<T> = anyhow::Result<T, Error>;
+
+#[derive(PartialEq)]
+enum SocketDevState {
+    Disconnected,
+    Connecting,
+    Connected,
+}
+
+pub struct SocketDev {
+    state: SocketDevState,
+    stream: Option<UnixStream>,
+    // Fd sent to swtpm process for Data Channel
+    write_msgfd: RawFd,
+    // Data Channel used by Cloud-Hypervisor
+    data_fd: RawFd,
+    // Control Channel used by Cloud-Hypervisor
+    control_fd: RawFd,
+}
+
+impl Default for SocketDev {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SocketDev {
+    pub fn new() -> Self {
+        Self {
+            state: SocketDevState::Disconnected,
+            stream: None,
+            write_msgfd: -1,
+            control_fd: -1,
+            data_fd: -1,
+        }
+    }
+
+    pub fn init(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        self.connect(path)?;
+        Ok(())
+    }
+
+    pub fn connect(&mut self, socket_path: impl AsRef<Path>) -> Result<()> {
+        let socket_path = socket_path.as_ref();
+        self.state = SocketDevState::Connecting;
+
+        let socket_path_s = socket_path.to_str().unwrap();
+        let s = UnixStream::connect(socket_path).map_err(|e| {
+            Error::ConnectToSocket(anyhow!("Failed to connect to tpm Socket. Error: {e:?}"))
+        })?;
+        self.control_fd = s.as_raw_fd();
+        self.stream = Some(s);
+        self.state = SocketDevState::Connected;
+        debug!("Connected to tpm socket path : {socket_path_s:?}");
+        Ok(())
+    }
+
+    pub fn set_datafd(&mut self, fd: RawFd) {
+        self.data_fd = fd;
+    }
+
+    pub fn set_msgfd(&mut self, fd: RawFd) {
+        self.write_msgfd = fd;
+    }
+
+    pub fn send_full(&self, buf: &[u8]) -> Result<usize> {
+        let write_fd = self.write_msgfd;
+
+        let size = self
+            .stream
+            .as_ref()
+            .unwrap()
+            .send_with_fd(buf, write_fd)
+            .map_err(|e| {
+                Error::WriteToSocket(anyhow!("Failed to write to Socket. Error: {e:?}"))
+            })?;
+
+        Ok(size)
+    }
+
+    pub fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        if self.stream.is_none() {
+            return Err(Error::WriteToSocket(anyhow!(
+                "Stream for tpm socket was not initialized"
+            )));
+        }
+
+        if matches!(self.state, SocketDevState::Connected) {
+            let ret = self.send_full(buf)?;
+            // swtpm will receive data Fd after a successful send
+            // Reset cached write_msgfd after a successful send
+            // Ideally, write_msgfd is reset after first Ctrl Command
+            if ret > 0 && self.write_msgfd != 0 {
+                self.write_msgfd = 0;
+            }
+            Ok(ret)
+        } else {
+            Err(Error::WriteToSocket(anyhow!(
+                "TPM Socket was not in Connected State"
+            )))
+        }
+    }
+
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        if self.stream.is_none() {
+            return Err(Error::ReadFromSocket(anyhow!(
+                "Stream for tpm socket was not initialized"
+            )));
+        }
+        let mut socket = self.stream.as_ref().unwrap();
+        let size: usize = socket.read(buf).map_err(|e| {
+            Error::ReadFromSocket(anyhow!("Failed to read from socket. Error Code {e:?}"))
+        })?;
+        Ok(size)
+    }
+
+    /// Read exactly `expected` bytes from the socket into `buf[0..expected]`.
+    ///
+    /// swtpm may split a control response into multiple writes on the
+    /// underlying SOCK_STREAM, so a single `read()` is not guaranteed to
+    /// return the full response in one shot. This helper loops until the
+    /// expected number of bytes have been collected (or an error is hit).
+    pub fn read_exact(&mut self, buf: &mut [u8], expected: usize) -> Result<usize> {
+        if self.stream.is_none() {
+            return Err(Error::ReadFromSocket(anyhow!(
+                "Stream for tpm socket was not initialized"
+            )));
+        }
+        if expected > buf.len() {
+            return Err(Error::ReadFromSocket(anyhow!(
+                "Buffer too small: have {} bytes, need {}",
+                buf.len(),
+                expected
+            )));
+        }
+        let mut socket = self.stream.as_ref().unwrap();
+        let mut total = 0usize;
+        while total < expected {
+            match socket.read(&mut buf[total..expected]) {
+                Ok(0) => {
+                    return Err(Error::ReadFromSocket(anyhow!(
+                        "Unexpected EOF while reading from socket: got {total} bytes, expected {expected}"
+                    )));
+                }
+                Ok(n) => total += n,
+                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    return Err(Error::ReadFromSocket(anyhow!(
+                        "Failed to read from socket. Error Code {e:?}"
+                    )));
+                }
+            }
+        }
+        Ok(total)
+    }
+}

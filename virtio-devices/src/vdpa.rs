@@ -1,0 +1,615 @@
+// Copyright © 2022 Intel Corporation
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::{io, result};
+
+use anyhow::anyhow;
+use event_monitor::event;
+use log::{debug, error, info};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use vhost::vdpa::{VhostVdpa, VhostVdpaIovaRange};
+use vhost::vhost_kern::VhostKernFeatures;
+use vhost::vhost_kern::vdpa::VhostKernVdpa;
+use vhost::vhost_kern::vhost_binding::VHOST_BACKEND_F_SUSPEND;
+use vhost::{VhostBackend, VringConfigData};
+use virtio_queue::desc::RawDescriptor;
+use virtio_queue::{Queue, QueueT};
+use vm_device::dma_mapping::ExternalDmaMapping;
+use vm_memory::{GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryBackend};
+use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
+use vm_virtio::{AccessPlatform, Translatable};
+use vmm_sys_util::eventfd::EventFd;
+
+use crate::device::ActivationContext;
+use crate::{
+    ActivateError, ActivateResult, DEVICE_ACKNOWLEDGE, DEVICE_DRIVER, DEVICE_DRIVER_OK,
+    DEVICE_FEATURES_OK, GuestMemoryMmap, VIRTIO_F_ACCESS_PLATFORM, VirtioCommon, VirtioDevice,
+    VirtioInterrupt, VirtioInterruptType, get_host_address_range,
+};
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("Failed to create vhost-vdpa")]
+    CreateVhostVdpa(#[source] vhost::Error),
+    #[error("Failed to map DMA range")]
+    DmaMap(#[source] vhost::Error),
+    #[error("Failed to unmap DMA range")]
+    DmaUnmap(#[source] vhost::Error),
+    #[error("Failed to get address range")]
+    GetAddressRange,
+    #[error("Failed to get the available index from the virtio queue")]
+    GetAvailableIndex(#[source] virtio_queue::Error),
+    #[error("Get virtio configuration size")]
+    GetConfigSize(#[source] vhost::Error),
+    #[error("Get virtio device identifier")]
+    GetDeviceId(#[source] vhost::Error),
+    #[error("Failed to get backend specific features")]
+    GetBackendFeatures(#[source] vhost::Error),
+    #[error("Failed to get virtio features")]
+    GetFeatures(#[source] vhost::Error),
+    #[error("Failed to get the IOVA range")]
+    GetIovaRange(#[source] vhost::Error),
+    #[error("Failed to get queue size")]
+    GetVringNum(#[source] vhost::Error),
+    #[error("Invalid IOVA range: {0}-{1}")]
+    InvalidIovaRange(u64, u64),
+    #[error("Missing VIRTIO_F_ACCESS_PLATFORM feature")]
+    MissingAccessPlatformVirtioFeature,
+    #[error("Failed to reset owner")]
+    ResetOwner(#[source] vhost::Error),
+    #[error("Failed to set backend specific features")]
+    SetBackendFeatures(#[source] vhost::Error),
+    #[error("Failed to set backend configuration")]
+    SetConfig(#[source] vhost::Error),
+    #[error("Failed to set eventfd notifying about a configuration change")]
+    SetConfigCall(#[source] vhost::Error),
+    #[error("Failed to set virtio features")]
+    SetFeatures(#[source] vhost::Error),
+    #[error("Failed to set memory table")]
+    SetMemTable(#[source] vhost::Error),
+    #[error("Failed to set owner")]
+    SetOwner(#[source] vhost::Error),
+    #[error("Failed to set virtio status")]
+    SetStatus(#[source] vhost::Error),
+    #[error("Failed to set vring address")]
+    SetVringAddr(#[source] vhost::Error),
+    #[error("Failed to set vring base")]
+    SetVringBase(#[source] vhost::Error),
+    #[error("Failed to set vring eventfd when buffer are used")]
+    SetVringCall(#[source] vhost::Error),
+    #[error("Failed to enable/disable vring")]
+    SetVringEnable(#[source] vhost::Error),
+    #[error("Failed to set vring eventfd when new descriptors are available")]
+    SetVringKick(#[source] vhost::Error),
+    #[error("Failed to set vring size")]
+    SetVringNum(#[source] vhost::Error),
+    #[error("Failed to translate address")]
+    TranslateAddress(#[source] io::Error),
+}
+
+pub type Result<T> = result::Result<T, Error>;
+
+#[derive(Serialize, Deserialize)]
+pub struct VdpaState {
+    pub avail_features: u64,
+    pub acked_features: u64,
+    pub device_type: u32,
+    pub iova_range_first: u64,
+    pub iova_range_last: u64,
+    pub config: Vec<u8>,
+    pub queue_sizes: Vec<u16>,
+    pub backend_features: u64,
+}
+
+pub struct Vdpa {
+    common: VirtioCommon,
+    id: String,
+    vhost: Option<VhostKernVdpa<GuestMemoryAtomic<GuestMemoryMmap>>>,
+    iova_range: VhostVdpaIovaRange,
+    enabled_queues: BTreeMap<u16, bool>,
+    backend_features: u64,
+    migrating: bool,
+}
+
+impl Vdpa {
+    pub fn new(
+        id: String,
+        device_path: &str,
+        mem: GuestMemoryAtomic<GuestMemoryMmap>,
+        num_queues: u16,
+        state: Option<VdpaState>,
+    ) -> Result<Self> {
+        let mut vhost = VhostKernVdpa::new(device_path, mem).map_err(Error::CreateVhostVdpa)?;
+        vhost.set_owner().map_err(Error::SetOwner)?;
+
+        let (
+            device_type,
+            avail_features,
+            acked_features,
+            queue_sizes,
+            iova_range,
+            backend_features,
+            paused,
+        ) = if let Some(state) = state {
+            info!("Restoring vDPA {id}");
+
+            vhost.set_backend_features_acked(state.backend_features);
+            vhost
+                .set_config(0, state.config.as_slice())
+                .map_err(Error::SetConfig)?;
+
+            (
+                state.device_type,
+                state.avail_features,
+                state.acked_features,
+                state.queue_sizes,
+                VhostVdpaIovaRange {
+                    first: state.iova_range_first,
+                    last: state.iova_range_last,
+                },
+                state.backend_features,
+                false,
+            )
+        } else {
+            let device_type = vhost.get_device_id().map_err(Error::GetDeviceId)?;
+            let queue_size = vhost.get_vring_num().map_err(Error::GetVringNum)?;
+            let avail_features = vhost.get_features().map_err(Error::GetFeatures)?;
+            let backend_features = vhost
+                .get_backend_features()
+                .map_err(Error::GetBackendFeatures)?;
+            vhost.set_backend_features_acked(backend_features);
+
+            let iova_range = vhost.get_iova_range().map_err(Error::GetIovaRange)?;
+
+            if avail_features & (1u64 << VIRTIO_F_ACCESS_PLATFORM) == 0 {
+                return Err(Error::MissingAccessPlatformVirtioFeature);
+            }
+
+            (
+                device_type,
+                avail_features,
+                0,
+                vec![queue_size; num_queues as usize],
+                iova_range,
+                backend_features,
+                false,
+            )
+        };
+
+        Ok(Vdpa {
+            common: VirtioCommon {
+                device_type,
+                queue_sizes,
+                avail_features,
+                acked_features,
+                min_queues: num_queues,
+                paused: Arc::new(AtomicBool::new(paused)),
+                ..Default::default()
+            },
+            id,
+            vhost: Some(vhost),
+            iova_range,
+            enabled_queues: BTreeMap::new(),
+            backend_features,
+            migrating: false,
+        })
+    }
+
+    fn enable_vrings(&mut self, enable: bool) -> Result<()> {
+        assert!(self.vhost.is_some());
+
+        for (queue_index, enabled) in self.enabled_queues.iter_mut() {
+            if *enabled != enable {
+                self.vhost
+                    .as_ref()
+                    .unwrap()
+                    .set_vring_enable(*queue_index as usize, enable)
+                    .map_err(Error::SetVringEnable)?;
+                *enabled = enable;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn activate_vdpa(
+        &mut self,
+        _mem: &GuestMemoryMmap,
+        virtio_interrupt: &dyn VirtioInterrupt,
+        queues: &[(u16, Queue, EventFd)],
+    ) -> Result<()> {
+        assert!(self.vhost.is_some());
+        self.vhost
+            .as_ref()
+            .unwrap()
+            .set_features(self.common.acked_features)
+            .map_err(Error::SetFeatures)?;
+        self.vhost
+            .as_mut()
+            .unwrap()
+            .set_backend_features(self.backend_features)
+            .map_err(Error::SetBackendFeatures)?;
+
+        for (queue_index, queue, queue_evt) in queues.iter() {
+            let queue_max_size = queue.max_size();
+            let queue_size = queue.size();
+            self.vhost
+                .as_ref()
+                .unwrap()
+                .set_vring_num(*queue_index as usize, queue_size)
+                .map_err(Error::SetVringNum)?;
+
+            let config_data = VringConfigData {
+                queue_max_size,
+                queue_size,
+                flags: 0u32,
+                desc_table_addr: queue
+                    .desc_table()
+                    .translate_gpa(
+                        self.common.access_platform().as_deref(),
+                        queue_size as usize * size_of::<RawDescriptor>(),
+                    )
+                    .map_err(Error::TranslateAddress)?,
+                used_ring_addr: queue
+                    .used_ring()
+                    .translate_gpa(
+                        self.common.access_platform().as_deref(),
+                        4 + queue_size as usize * 8,
+                    )
+                    .map_err(Error::TranslateAddress)?,
+                avail_ring_addr: queue
+                    .avail_ring()
+                    .translate_gpa(
+                        self.common.access_platform().as_deref(),
+                        4 + queue_size as usize * 2,
+                    )
+                    .map_err(Error::TranslateAddress)?,
+                log_addr: None,
+            };
+
+            self.vhost
+                .as_ref()
+                .unwrap()
+                .set_vring_addr(*queue_index as usize, &config_data)
+                .map_err(Error::SetVringAddr)?;
+            self.vhost
+                .as_ref()
+                .unwrap()
+                .set_vring_base(*queue_index as usize, 0)
+                .map_err(Error::SetVringBase)?;
+
+            if let Some(eventfd) =
+                virtio_interrupt.notifier(VirtioInterruptType::Queue(*queue_index))
+            {
+                self.vhost
+                    .as_ref()
+                    .unwrap()
+                    .set_vring_call(*queue_index as usize, &eventfd)
+                    .map_err(Error::SetVringCall)?;
+            }
+
+            self.vhost
+                .as_ref()
+                .unwrap()
+                .set_vring_kick(*queue_index as usize, queue_evt)
+                .map_err(Error::SetVringKick)?;
+
+            self.enabled_queues.insert(*queue_index, false);
+        }
+
+        // Setup the config eventfd if there is one
+        if let Some(eventfd) = virtio_interrupt.notifier(VirtioInterruptType::Config) {
+            self.vhost
+                .as_ref()
+                .unwrap()
+                .set_config_call(&eventfd)
+                .map_err(Error::SetConfigCall)?;
+        }
+
+        self.enable_vrings(true)?;
+
+        self.vhost
+            .as_ref()
+            .unwrap()
+            .set_status(
+                (DEVICE_ACKNOWLEDGE | DEVICE_DRIVER | DEVICE_DRIVER_OK | DEVICE_FEATURES_OK) as u8,
+            )
+            .map_err(Error::SetStatus)
+    }
+
+    fn reset_vdpa(&mut self) -> Result<()> {
+        self.enable_vrings(false)?;
+
+        assert!(self.vhost.is_some());
+        self.vhost
+            .as_ref()
+            .unwrap()
+            .set_status(0)
+            .map_err(Error::SetStatus)
+    }
+
+    /// # SAFETY
+    ///
+    /// `host_vaddr` must point to `size` bytes of valid memory.
+    unsafe fn dma_map(
+        &mut self,
+        iova: u64,
+        size: u64,
+        host_vaddr: *const u8,
+        readonly: bool,
+    ) -> Result<()> {
+        let Some(iova_last) = iova.checked_add(size) else {
+            return Err(Error::InvalidIovaRange(iova, u64::MAX));
+        };
+        let Some(iova_last) = iova_last.checked_sub(1) else {
+            return Err(Error::InvalidIovaRange(0, 0));
+        };
+        if iova < self.iova_range.first || iova_last > self.iova_range.last {
+            return Err(Error::InvalidIovaRange(iova, iova_last));
+        }
+        if isize::try_from(size).is_err() {
+            return Err(Error::InvalidIovaRange(iova, iova_last));
+        }
+
+        assert!(self.vhost.is_some());
+        self.vhost
+            .as_ref()
+            .unwrap()
+            .dma_map(iova, size, host_vaddr, readonly)
+            .map_err(Error::DmaMap)
+    }
+
+    fn dma_unmap(&self, iova: u64, size: u64) -> Result<()> {
+        let Some(iova_last) = iova.checked_add(size) else {
+            return Err(Error::InvalidIovaRange(iova, u64::MAX));
+        };
+        let Some(iova_last) = iova_last.checked_sub(1) else {
+            return Err(Error::InvalidIovaRange(0, 0));
+        };
+        if iova < self.iova_range.first || iova_last > self.iova_range.last {
+            return Err(Error::InvalidIovaRange(iova, iova_last));
+        }
+
+        assert!(self.vhost.is_some());
+        self.vhost
+            .as_ref()
+            .unwrap()
+            .dma_unmap(iova, size)
+            .map_err(Error::DmaUnmap)
+    }
+
+    fn state(&self) -> Result<VdpaState> {
+        assert!(self.vhost.is_some());
+        let config_size = self
+            .vhost
+            .as_ref()
+            .unwrap()
+            .get_config_size()
+            .map_err(Error::GetConfigSize)?;
+        let mut config = vec![0; config_size as usize];
+        self.read_config(0, config.as_mut_slice());
+
+        Ok(VdpaState {
+            avail_features: self.common.avail_features,
+            acked_features: self.common.acked_features,
+            device_type: self.common.device_type,
+            queue_sizes: self.common.queue_sizes.clone(),
+            iova_range_first: self.iova_range.first,
+            iova_range_last: self.iova_range.last,
+            config,
+            backend_features: self.backend_features,
+        })
+    }
+}
+
+impl VirtioDevice for Vdpa {
+    fn device_type(&self) -> u32 {
+        self.common.device_type
+    }
+
+    fn queue_max_sizes(&self) -> &[u16] {
+        &self.common.queue_sizes
+    }
+
+    fn features(&self) -> u64 {
+        self.common.avail_features
+    }
+
+    fn ack_features(&mut self, value: u64) {
+        self.common.ack_features(value);
+    }
+
+    fn read_config(&self, offset: u64, data: &mut [u8]) {
+        assert!(self.vhost.is_some());
+        if let Err(e) = self.vhost.as_ref().unwrap().get_config(offset as u32, data) {
+            error!("Failed reading virtio config: {e}");
+        }
+    }
+
+    fn write_config(&mut self, offset: u64, data: &[u8]) {
+        assert!(self.vhost.is_some());
+        if let Err(e) = self.vhost.as_ref().unwrap().set_config(offset as u32, data) {
+            error!("Failed writing virtio config: {e}");
+        }
+    }
+
+    fn activate(&mut self, context: ActivationContext) -> ActivateResult {
+        let ActivationContext {
+            mem,
+            interrupt_cb: virtio_interrupt,
+            queues,
+            ..
+        } = context;
+        self.activate_vdpa(&mem.memory(), virtio_interrupt.as_ref(), &queues)
+            .map_err(ActivateError::ActivateVdpa)?;
+
+        self.common.interrupt_cb = Some(virtio_interrupt);
+
+        event!("vdpa", "activated", "id", &self.id);
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        // Backend reset failures are logged but don't skip local cleanup:
+        // reset must converge to fresh state regardless of backend state.
+        if let Err(e) = self.reset_vdpa() {
+            error!("Failed to reset vhost-vdpa: {e:?}");
+        }
+
+        event!("vdpa", "reset", "id", &self.id);
+
+        // Drop the interrupt callback clone
+        self.common.interrupt_cb = None;
+    }
+
+    fn set_access_platform(&mut self, access_platform: Arc<dyn AccessPlatform>) {
+        self.common.set_access_platform(access_platform);
+    }
+
+    fn access_platform(&self) -> Option<Arc<dyn AccessPlatform>> {
+        self.common.access_platform()
+    }
+}
+
+impl Pausable for Vdpa {
+    fn pause(&mut self) -> result::Result<(), MigratableError> {
+        if self.migrating {
+            Ok(())
+        } else {
+            Err(MigratableError::Pause(anyhow!(
+                "Can't pause a vDPA device outside live migration"
+            )))
+        }
+    }
+
+    fn resume(&mut self) -> result::Result<(), MigratableError> {
+        if !self.common.paused.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        if self.migrating {
+            Ok(())
+        } else {
+            Err(MigratableError::Resume(anyhow!(
+                "Can't resume a vDPA device outside live migration"
+            )))
+        }
+    }
+}
+
+impl Snapshottable for Vdpa {
+    fn id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
+        if !self.migrating {
+            return Err(MigratableError::Snapshot(anyhow!(
+                "Can't snapshot a vDPA device outside live migration"
+            )));
+        }
+
+        let snapshot = Snapshot::new_from_state(&self.state().map_err(|e| {
+            MigratableError::Snapshot(anyhow!("Error snapshotting vDPA device: {e:?}"))
+        })?)?;
+
+        // Force the vhost handler to be dropped in order to close the vDPA
+        // file. This will ensure the device can be accessed if the VM is
+        // migrated on the same host machine.
+        self.vhost.take();
+
+        Ok(snapshot)
+    }
+}
+
+impl Transportable for Vdpa {}
+
+impl Migratable for Vdpa {
+    fn start_migration(&mut self) -> result::Result<(), MigratableError> {
+        self.migrating = true;
+        // Given there's no way to track dirty pages, we must suspend the
+        // device as soon as the migration process starts.
+        if self.backend_features & (1 << VHOST_BACKEND_F_SUSPEND) != 0 {
+            assert!(self.vhost.is_some());
+            self.vhost.as_ref().unwrap().suspend().map_err(|e| {
+                MigratableError::StartMigration(anyhow!("Error suspending vDPA device: {e:?}"))
+            })
+        } else {
+            Err(MigratableError::StartMigration(anyhow!(
+                "vDPA device can't be suspended"
+            )))
+        }
+    }
+
+    fn complete_migration(&mut self) -> result::Result<(), MigratableError> {
+        self.migrating = false;
+        Ok(())
+    }
+}
+
+pub struct VdpaDmaMapping<M: GuestAddressSpace> {
+    device: Arc<Mutex<Vdpa>>,
+    memory: Arc<M>,
+}
+
+impl<M: GuestAddressSpace> VdpaDmaMapping<M> {
+    pub fn new(device: Arc<Mutex<Vdpa>>, memory: Arc<M>) -> Self {
+        Self { device, memory }
+    }
+}
+
+impl<M: GuestAddressSpace + Sync + Send> ExternalDmaMapping for VdpaDmaMapping<M>
+where
+    M::M: GuestMemoryBackend,
+{
+    fn map(&self, iova: u64, gpa: u64, size: u64) -> result::Result<(), io::Error> {
+        let usize_size = size.try_into().unwrap();
+        let mem = self.memory.memory();
+        let guest_addr = GuestAddress(gpa);
+        let Some(user_addr) = get_host_address_range(&*mem, guest_addr, usize_size) else {
+            return Err(io::Error::other(format!(
+                "failed to convert guest address 0x{gpa:x} into \
+                     host user virtual address"
+            )));
+        };
+
+        debug!(
+            "DMA map iova 0x{:x}, gpa 0x{:x}, size 0x{:x}, host_addr 0x{:x}",
+            iova, gpa, size, user_addr as u64
+        );
+        // SAFETY: get_host_address_range() guarantees that
+        // user_addr points to `size` bytes of memory.
+        unsafe {
+            self.device
+                .lock()
+                .unwrap()
+                .dma_map(iova, size, user_addr, false)
+                .map_err(|e| {
+                    io::Error::other(format!(
+                        "failed to map memory for vDPA device, \
+                         iova 0x{iova:x}, gpa 0x{gpa:x}, size 0x{size:x}: {e:?}"
+                    ))
+                })
+        }
+    }
+
+    fn unmap(&self, iova: u64, size: u64) -> io::Result<()> {
+        debug!("DMA unmap iova 0x{iova:x} size 0x{size:x}");
+        self.device
+            .lock()
+            .unwrap()
+            .dma_unmap(iova, size)
+            .map_err(|e| {
+                io::Error::other(format!(
+                    "failed to unmap memory for vDPA device, \
+                     iova 0x{iova:x}, size 0x{size:x}: {e:?}"
+                ))
+            })
+    }
+}
