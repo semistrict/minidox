@@ -48,15 +48,16 @@ use vmm_sys_util::signal::unblock_signal;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::api::{
-    ApiRequest, ApiResponse, MigrationMode, RequestHandler, TimeoutStrategy, VmInfoResponse,
-    VmReceiveMigrationData, VmSendMigrationData, VmmPingResponse,
+    ApiRequest, ApiResponse, MigrationMode, RequestHandler, TimeoutStrategy, VmForkStateCapture,
+    VmInfoResponse, VmReceiveMigrationData, VmRestoreForkStateData, VmSendMigrationData,
+    VmmPingResponse,
 };
 use crate::config::{MemoryRestoreMode, RestoreConfig, VmMemoryZoneUpdateData, add_to_config};
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::GuestDebuggable;
 use crate::device_manager::DeviceManager;
 use crate::landlock::Landlock;
-use crate::memory_manager::{MemoryManager, MemoryRangePolicy};
+use crate::memory_manager::{ExternalGuestMemory, MemoryManager, MemoryRangePolicy};
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 use crate::migration::get_vm_snapshot;
 use crate::migration::transport::{
@@ -701,6 +702,7 @@ pub struct Vmm {
     version: VmmVersionInfo,
     vm: VmOwnership,
     vm_config: Option<Arc<Mutex<VmConfig>>>,
+    external_guest_memory: Option<ExternalGuestMemory>,
     seccomp_action: SeccompAction,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     activate_evt: EventFd,
@@ -930,6 +932,7 @@ impl Vmm {
             version: vmm_version,
             vm: VmOwnership::None,
             vm_config: None,
+            external_guest_memory: None,
             seccomp_action,
             hypervisor,
             activate_evt,
@@ -1278,6 +1281,7 @@ impl Vmm {
             false,
             Some(&vm_migration_config.memory_manager_data),
             existing_memory_files,
+            None,
         )
         .context("Error creating MemoryManager from snapshot")
         .map_err(MigratableError::MigrateReceive)?;
@@ -2006,6 +2010,7 @@ impl Vmm {
                     Some(source_url),
                     Some(prefault),
                     Some(memory_restore_mode),
+                    None,
                 )?;
 
                 if self
@@ -2332,6 +2337,31 @@ fn update_memory_zones(
     Ok(())
 }
 
+fn dirty_host_pages(memory_regions: &[(u64, u64)], dirty_memory: &MemoryRangeTable) -> Vec<usize> {
+    const PAGE_SIZE: u64 = 4096;
+
+    let mut pages = HashSet::new();
+    let mut host_offset = 0u64;
+    for &(region_gpa, region_len) in memory_regions {
+        let region_end = region_gpa + region_len;
+        for dirty in dirty_memory.regions() {
+            let dirty_end = dirty.gpa + dirty.length;
+            let start = dirty.gpa.max(region_gpa);
+            let end = dirty_end.min(region_end);
+            if start < end {
+                let first = (host_offset + start - region_gpa) / PAGE_SIZE;
+                let last = (host_offset + end - region_gpa - 1) / PAGE_SIZE;
+                pages.extend(first as usize..=last as usize);
+            }
+        }
+        host_offset += region_len;
+    }
+
+    let mut pages = pages.into_iter().collect::<Vec<_>>();
+    pages.sort_unstable();
+    pages
+}
+
 impl RequestHandler for Vmm {
     fn vm_create(&mut self, config: Box<VmConfig>) -> result::Result<(), VmError> {
         match &self.vm {
@@ -2419,6 +2449,7 @@ impl RequestHandler for Vmm {
                             None,
                             None,
                             None,
+                            self.external_guest_memory.take(),
                         )?;
 
                         let r = vm.boot();
@@ -2438,12 +2469,141 @@ impl RequestHandler for Vmm {
         }
     }
 
+    fn vm_set_external_memory(
+        &mut self,
+        memory: ExternalGuestMemory,
+    ) -> result::Result<(), VmError> {
+        match self.vm {
+            VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
+            VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
+            VmOwnership::None => {
+                self.external_guest_memory = Some(memory);
+                Ok(())
+            }
+        }
+    }
+
     fn vm_pause(&mut self) -> result::Result<(), VmError> {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => vm.pause().map_err(VmError::Pause),
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
             VmOwnership::None => Err(VmError::VmNotRunning),
         }
+    }
+
+    fn vm_begin_fork_tracking(&mut self) -> result::Result<(), VmError> {
+        match self.vm {
+            VmOwnership::Owned(ref mut vm) => vm.start_dirty_log().map_err(VmError::Snapshot),
+            VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
+            VmOwnership::None => Err(VmError::VmNotRunning),
+        }
+    }
+
+    fn vm_capture_fork_state(&mut self) -> result::Result<VmForkStateCapture, VmError> {
+        let config = self
+            .vm_config
+            .as_ref()
+            .ok_or(VmError::VmMissingConfig)?
+            .lock()
+            .unwrap()
+            .clone();
+
+        match self.vm {
+            VmOwnership::Owned(ref mut vm) => {
+                if vm.restoring() {
+                    return Err(VmError::VmRestoring);
+                }
+
+                let dirty_memory = vm.dirty_log().map_err(VmError::Snapshot)?;
+                let dirty_ram_pages = dirty_host_pages(&vm.guest_memory_regions(), &dirty_memory);
+                let snapshot = vm.snapshot().map_err(VmError::Snapshot)?;
+                Ok(VmForkStateCapture {
+                    config: Box::new(config),
+                    snapshot,
+                    dirty_memory,
+                    dirty_ram_pages,
+                })
+            }
+            VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
+            VmOwnership::None => Err(VmError::VmNotRunning),
+        }
+    }
+
+    fn vm_restore_fork_state(
+        &mut self,
+        data: VmRestoreForkStateData,
+    ) -> result::Result<(), VmError> {
+        match self.vm {
+            VmOwnership::Owned(_) => return Err(VmError::VmAlreadyCreated),
+            VmOwnership::Migration { .. } => return Err(VmError::VmMigrating),
+            VmOwnership::None => {}
+        }
+
+        let config = Arc::new(Mutex::new(*data.capture.config));
+        let snapshot = data.capture.snapshot;
+
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        {
+            let vm_snapshot = get_vm_snapshot(&snapshot).map_err(VmError::Restore)?;
+            self.vm_check_cpuid_compatibility(&config, &vm_snapshot.common_cpuid)
+                .map_err(VmError::Restore)?;
+        }
+
+        self.vm_config = Some(Arc::clone(&config));
+        self.console_info =
+            Some(pre_create_console_devices(self).map_err(VmError::CreateConsoleDevices)?);
+
+        let exit_evt = self.exit_evt.try_clone().map_err(VmError::EventFdClone)?;
+        let reset_evt = self.reset_evt.try_clone().map_err(VmError::EventFdClone)?;
+        let guest_exit_evt = self
+            .guest_exit_evt
+            .try_clone()
+            .map_err(VmError::EventFdClone)?;
+        #[cfg(feature = "guest_debug")]
+        let debug_evt = self
+            .vm_debug_evt
+            .try_clone()
+            .map_err(VmError::EventFdClone)?;
+        let activate_evt = self
+            .activate_evt
+            .try_clone()
+            .map_err(VmError::EventFdClone)?;
+
+        let mut vm = Vm::new(
+            config,
+            exit_evt,
+            reset_evt,
+            guest_exit_evt,
+            #[cfg(feature = "guest_debug")]
+            debug_evt,
+            &self.seccomp_action,
+            self.hypervisor.clone(),
+            activate_evt,
+            self.console_info.clone(),
+            self.console_resize_pipe.clone(),
+            Arc::clone(&self.original_termios_opt),
+            Some(&snapshot),
+            None,
+            None,
+            None,
+            Some(data.memory),
+        )?;
+
+        if self
+            .vm_config
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .landlock_enable
+        {
+            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
+            apply_landlock(&mut config).map_err(VmError::ApplyLandlock)?;
+        }
+
+        vm.restore()?;
+        self.vm = VmOwnership::Owned(vm);
+        Ok(())
     }
 
     fn vm_resume(&mut self) -> result::Result<(), VmError> {
@@ -2651,6 +2811,7 @@ impl RequestHandler for Vmm {
             self.console_info.clone(),
             self.console_resize_pipe.clone(),
             Arc::clone(&self.original_termios_opt),
+            None,
             None,
             None,
             None,

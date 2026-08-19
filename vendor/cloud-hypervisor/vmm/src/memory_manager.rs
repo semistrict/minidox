@@ -94,6 +94,16 @@ const PLATFORM_DEVICE_AREA_SIZE: u64 = 1 << 20;
 
 const MAX_PREFAULT_THREAD_COUNT: usize = 16;
 
+/// A contiguous, externally owned host mapping used as guest RAM.
+///
+/// The mapping is split across the architecture's guest-RAM regions in GPA
+/// order. Its owner must keep it mapped until the VM has shut down.
+#[derive(Clone, Copy, Debug)]
+pub struct ExternalGuestMemory {
+    pub userspace_addr: usize,
+    pub len: usize,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct HotPlugState {
     base: u64,
@@ -268,6 +278,10 @@ pub enum Error {
     /// Error from region creation
     #[error("Error from region creation")]
     GuestMemoryRegion(#[source] MmapRegionError),
+
+    /// An externally owned guest-RAM mapping has the wrong length.
+    #[error("external guest RAM length {provided} does not match required length {required}")]
+    InvalidExternalGuestMemory { provided: usize, required: usize },
 
     /// No ACPI slot available
     #[error("No ACPI slot available")]
@@ -614,6 +628,72 @@ pub enum MemoryRangePolicy {
 }
 
 impl MemoryManager {
+    fn replace_with_external_memory(
+        guest_memory: &GuestMemoryMmap,
+        memory_zones: &mut MemoryZones,
+        external: ExternalGuestMemory,
+    ) -> Result<GuestMemoryMmap, Error> {
+        let required = guest_memory
+            .iter()
+            .map(|region| region.len() as usize)
+            .sum::<usize>();
+        if external.len != required {
+            return Err(Error::InvalidExternalGuestMemory {
+                provided: external.len,
+                required,
+            });
+        }
+
+        let mut offset = 0usize;
+        let mut replacements = HashMap::new();
+        let mut regions = Vec::new();
+        for region in guest_memory.iter() {
+            let len = region.len() as usize;
+            let address = external.userspace_addr.checked_add(offset).ok_or(
+                Error::InvalidExternalGuestMemory {
+                    provided: external.len,
+                    required,
+                },
+            )? as *mut u8;
+            // SAFETY: ExternalGuestMemory's contract requires this complete
+            // address range to remain mapped for the MemoryManager lifetime.
+            let mmap = unsafe {
+                MmapRegion::build_raw(
+                    address,
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                )
+            }
+            .map_err(Error::GuestMemoryRegion)?;
+            let replacement = Arc::new(GuestRegionMmap::new(mmap, region.start_addr()).ok_or(
+                Error::GuestMemory(MmapError::InvalidGuestAddress(region.start_addr())),
+            )?);
+            replacements.insert(region.start_addr().raw_value(), Arc::clone(&replacement));
+            regions.push(replacement);
+            offset += len;
+        }
+
+        for zone in memory_zones.values_mut() {
+            for region in &mut zone.regions {
+                *region = Arc::clone(
+                    replacements
+                        .get(&region.start_addr().raw_value())
+                        .expect("every memory-zone region belongs to guest memory"),
+                );
+            }
+            if let Some(virtio_mem) = zone.virtio_mem_zone.as_mut() {
+                virtio_mem.region = Arc::clone(
+                    replacements
+                        .get(&virtio_mem.region.start_addr().raw_value())
+                        .expect("every virtio-mem region belongs to guest memory"),
+                );
+            }
+        }
+
+        GuestMemoryMmap::from_arc_regions(regions).map_err(Error::GuestRegionCollection)
+    }
+
     /// Creates all memory regions based on the available RAM ranges defined
     /// by `ram_regions`, and based on the description of the memory zones.
     /// In practice, this function can perform multiple memory mappings of the
@@ -1666,6 +1746,7 @@ impl MemoryManager {
         #[cfg(feature = "tdx")] tdx_enabled: bool,
         restore_data: Option<&MemoryManagerSnapshotData>,
         existing_memory_files: HashMap<u32, File>,
+        external_memory: Option<ExternalGuestMemory>,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
         trace_scoped!("MemoryManager::new");
 
@@ -1688,9 +1769,9 @@ impl MemoryManager {
             boot_ram,
             current_ram,
             arch_mem_regions,
-            memory_zones,
-            guest_memory,
-            boot_guest_memory,
+            mut memory_zones,
+            mut guest_memory,
+            mut boot_guest_memory,
             hotplug_slots,
             next_memory_slot,
             selected_slot,
@@ -1831,6 +1912,15 @@ impl MemoryManager {
             )
         };
 
+        if let Some(external_memory) = external_memory {
+            guest_memory = Self::replace_with_external_memory(
+                &guest_memory,
+                &mut memory_zones,
+                external_memory,
+            )?;
+            boot_guest_memory = guest_memory.clone();
+        }
+
         let guest_memory = GuestMemoryAtomic::new(guest_memory);
 
         let allocator = Arc::new(Mutex::new(
@@ -1940,6 +2030,7 @@ impl MemoryManager {
                 false,
                 Some(&mem_snapshot),
                 Default::default(),
+                None,
             )?;
 
             if memory_restore_mode == MemoryRestoreMode::OnDemand {

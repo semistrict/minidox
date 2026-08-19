@@ -3,13 +3,16 @@ use std::sync::mpsc::{Sender, channel};
 use std::thread::JoinHandle;
 
 use cloud_hypervisor::api::{
-    ApiAction, ApiRequest, VmBoot, VmCreate, VmPause, VmResume, VmmShutdown,
+    ApiAction, ApiRequest, VmBeginForkTracking, VmBoot, VmCaptureForkState, VmCreate,
+    VmForkStateCapture, VmPause, VmRestoreForkState, VmRestoreForkStateData, VmResume,
+    VmSetExternalMemory, VmmShutdown,
 };
+use cloud_hypervisor::memory_manager::ExternalGuestMemory;
 pub use cloud_hypervisor::vm_config::VmConfig;
 use seccompiler::SeccompAction;
 use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
-use crate::Error;
+use crate::{Error, KvmGuestRam};
 
 /// One Cloud Hypervisor VMM worker embedded in the minidox supervisor.
 ///
@@ -74,9 +77,51 @@ impl CloudHypervisorVm {
         self.send(&VmBoot, (), "boot VM").map(drop)
     }
 
+    /// Boot using a supervisor-owned, page-granular CoW RAM mapping.
+    pub fn boot_with_ram(&self, ram: &KvmGuestRam) -> Result<(), Error> {
+        self.send(
+            &VmSetExternalMemory,
+            ExternalGuestMemory {
+                userspace_addr: ram.as_ptr() as usize,
+                len: ram.len(),
+            },
+            "install external guest RAM",
+        )?;
+        self.boot()
+    }
+
     /// Pause vCPUs and devices at the VMM boundary.
     pub fn pause(&self) -> Result<(), Error> {
         self.send(&VmPause, (), "pause VM").map(drop)
+    }
+
+    /// Enable KVM and device dirty tracking for the next VM fork.
+    pub fn begin_fork_tracking(&self) -> Result<(), Error> {
+        self.send(&VmBeginForkTracking, (), "begin VM fork tracking")
+    }
+
+    /// Capture paused vCPU/device state and dirty RAM ranges in memory.
+    pub fn capture_fork_state(&self) -> Result<VmForkStateCapture, Error> {
+        self.send(&VmCaptureForkState, (), "capture VM fork state")
+    }
+
+    /// Recreate a paused child over a supervisor-owned CoW RAM branch.
+    pub fn restore_fork_state(
+        &self,
+        capture: VmForkStateCapture,
+        ram: &KvmGuestRam,
+    ) -> Result<(), Error> {
+        self.send(
+            &VmRestoreForkState,
+            VmRestoreForkStateData {
+                capture,
+                memory: ExternalGuestMemory {
+                    userspace_addr: ram.as_ptr() as usize,
+                    len: ram.len(),
+                },
+            },
+            "restore VM fork state",
+        )
     }
 
     /// Resume vCPUs and devices.

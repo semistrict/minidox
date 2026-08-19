@@ -77,11 +77,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracer::trace_scoped;
 use vm_device::Bus;
+use vm_memory::{
+    Address, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryBackend,
+    GuestMemoryRegion,
+};
 #[cfg(feature = "tdx")]
-use vm_memory::GuestMemoryBackend;
-#[cfg(feature = "tdx")]
-use vm_memory::{Address, ByteValued, GuestMemoryRegion, ReadVolatile};
-use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
+use vm_memory::{ByteValued, ReadVolatile};
 use vm_migration::protocol::{MemoryRangeTable, Request, Response};
 use vm_migration::{
     Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable, snapshot_from_id,
@@ -105,7 +106,8 @@ use crate::landlock::LandlockError;
 #[cfg(feature = "tdx")]
 use crate::memory_manager;
 use crate::memory_manager::{
-    Error as MemoryManagerError, MemoryManager, MemoryManagerSnapshotData, MemoryRangePolicy,
+    Error as MemoryManagerError, ExternalGuestMemory, MemoryManager, MemoryManagerSnapshotData,
+    MemoryRangePolicy,
 };
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::migration::url_to_file;
@@ -1354,6 +1356,7 @@ impl Vm {
         source_url: Option<&str>,
         prefault: Option<bool>,
         memory_restore_mode: Option<MemoryRestoreMode>,
+        external_guest_memory: Option<ExternalGuestMemory>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new");
 
@@ -1402,17 +1405,34 @@ impl Vm {
 
         let memory_manager =
             if let Some(snapshot) = snapshot_from_id(snapshot, MEMORY_MANAGER_SNAPSHOT_ID) {
-                MemoryManager::new_from_snapshot(
-                    snapshot,
-                    vm.clone(),
-                    &vm_config.lock().unwrap().memory.clone(),
-                    source_url,
-                    prefault.unwrap_or(false),
-                    memory_restore_mode.unwrap_or_default(),
-                    phys_bits,
-                    &exit_evt,
-                )
-                .map_err(Error::MemoryManager)?
+                if let Some(external_guest_memory) = external_guest_memory {
+                    let restore_data: MemoryManagerSnapshotData =
+                        snapshot.to_state().map_err(Error::Restore)?;
+                    MemoryManager::new(
+                        vm.clone(),
+                        &vm_config.lock().unwrap().memory.clone(),
+                        prefault,
+                        phys_bits,
+                        #[cfg(feature = "tdx")]
+                        false,
+                        Some(&restore_data),
+                        Default::default(),
+                        Some(external_guest_memory),
+                    )
+                    .map_err(Error::MemoryManager)?
+                } else {
+                    MemoryManager::new_from_snapshot(
+                        snapshot,
+                        vm.clone(),
+                        &vm_config.lock().unwrap().memory.clone(),
+                        source_url,
+                        prefault.unwrap_or(false),
+                        memory_restore_mode.unwrap_or_default(),
+                        phys_bits,
+                        &exit_evt,
+                    )
+                    .map_err(Error::MemoryManager)?
+                }
             } else {
                 MemoryManager::new(
                     vm.clone(),
@@ -1423,6 +1443,7 @@ impl Vm {
                     tdx_enabled,
                     None,
                     Default::default(),
+                    external_guest_memory,
                 )
                 .map_err(Error::MemoryManager)?
             };
@@ -2977,6 +2998,16 @@ impl Vm {
     /// Gets a thread-safe reference counted pointer to the VM configuration.
     pub fn get_config(&self) -> Arc<Mutex<VmConfig>> {
         Arc::clone(&self.config)
+    }
+
+    pub fn guest_memory_regions(&self) -> Vec<(u64, u64)> {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .boot_guest_memory()
+            .iter()
+            .map(|region| (region.start_addr().raw_value(), region.len()))
+            .collect()
     }
 
     /// Get the VM state.

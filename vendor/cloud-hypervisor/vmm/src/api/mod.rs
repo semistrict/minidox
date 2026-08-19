@@ -46,8 +46,9 @@ use micro_http::Body;
 use option_parser::{OptionParser, OptionParserError, Toggle, Tuple, TupleList};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use vm_migration::MigratableError;
+use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::tls::{TlsConfigError, TlsEndpoint, validate_tls_dir};
+use vm_migration::{MigratableError, Snapshot};
 use vmm_sys_util::eventfd::EventFd;
 
 #[cfg(feature = "dbus_api")]
@@ -58,6 +59,7 @@ use crate::config::{
     RestoreConfig, RestoredVfioConfig, VmMemoryZoneUpdateData, deserialize_restored_fd,
 };
 use crate::device_tree::DeviceTree;
+use crate::memory_manager::ExternalGuestMemory;
 use crate::migration::transport::{
     MAX_MIGRATION_CONNECTIONS, TcpAddressParseError, tcp_address_to_server_name,
 };
@@ -90,6 +92,10 @@ pub enum ApiError {
     #[error("The VM could not boot")]
     VmBoot(#[source] VmError),
 
+    /// Externally owned guest RAM could not be installed.
+    #[error("Externally owned guest RAM could not be installed")]
+    VmSetExternalMemory(#[source] VmError),
+
     /// The VM could not be created.
     #[error("The VM could not be created")]
     VmCreate(#[source] VmError),
@@ -105,6 +111,18 @@ pub enum ApiError {
     /// The VM could not be paused.
     #[error("The VM could not be paused")]
     VmPause(#[source] VmError),
+
+    /// Dirty tracking could not be enabled for a VM fork.
+    #[error("Dirty tracking could not be enabled for a VM fork")]
+    VmBeginForkTracking(#[source] VmError),
+
+    /// The paused VM state could not be captured for a fork.
+    #[error("The paused VM state could not be captured for a fork")]
+    VmCaptureForkState(#[source] VmError),
+
+    /// A child VM could not be restored from captured fork state.
+    #[error("A child VM could not be restored from captured fork state")]
+    VmRestoreForkState(#[source] VmError),
 
     /// The VM could not resume.
     #[error("The VM could not resume")]
@@ -842,6 +860,26 @@ pub enum ApiResponsePayload {
 
     /// Vm action response
     VmAction(Option<Vec<u8>>),
+
+    /// Paused VM state and dirty memory ranges for an in-process fork.
+    VmForkState(VmForkStateCapture),
+}
+
+/// Machine state captured at the pause barrier for an in-process VM fork.
+///
+/// RAM contents remain in their existing guest-memory backing. The dirty
+/// ranges identify the pages the supervisor must materialize into its next
+/// copy-on-write RAM root.
+pub struct VmForkStateCapture {
+    pub config: Box<VmConfig>,
+    pub snapshot: Snapshot,
+    pub dirty_memory: MemoryRangeTable,
+    pub dirty_ram_pages: Vec<usize>,
+}
+
+pub struct VmRestoreForkStateData {
+    pub capture: VmForkStateCapture,
+    pub memory: ExternalGuestMemory,
 }
 
 /// This is the response sent by the VMM API server through the mpsc channel.
@@ -852,7 +890,15 @@ pub trait RequestHandler {
 
     fn vm_boot(&mut self) -> Result<(), VmError>;
 
+    fn vm_set_external_memory(&mut self, memory: ExternalGuestMemory) -> Result<(), VmError>;
+
     fn vm_pause(&mut self) -> Result<(), VmError>;
+
+    fn vm_begin_fork_tracking(&mut self) -> Result<(), VmError>;
+
+    fn vm_capture_fork_state(&mut self) -> Result<VmForkStateCapture, VmError>;
+
+    fn vm_restore_fork_state(&mut self, data: VmRestoreForkStateData) -> Result<(), VmError>;
 
     fn vm_resume(&mut self) -> Result<(), VmError>;
 
@@ -1358,6 +1404,46 @@ impl ApiAction for VmBoot {
     }
 }
 
+pub struct VmSetExternalMemory;
+
+impl ApiAction for VmSetExternalMemory {
+    type RequestBody = ExternalGuestMemory;
+    type ResponseBody = ();
+
+    fn request(
+        &self,
+        memory: Self::RequestBody,
+        response_sender: Sender<ApiResponse>,
+    ) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmSetExternalMemory");
+
+            let response = vmm
+                .vm_set_external_memory(memory)
+                .map_err(ApiError::VmSetExternalMemory)
+                .map(|_| ApiResponsePayload::Empty);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        match get_response(self, api_evt, api_sender, data)? {
+            ApiResponsePayload::Empty => Ok(()),
+            _ => Err(ApiError::ResponsePayloadType),
+        }
+    }
+}
+
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 pub struct VmCoredump;
 
@@ -1570,6 +1656,114 @@ impl ApiAction for VmPause {
         data: Self::RequestBody,
     ) -> ApiResult<Self::ResponseBody> {
         get_response_body(self, api_evt, api_sender, data)
+    }
+}
+
+pub struct VmBeginForkTracking;
+
+impl ApiAction for VmBeginForkTracking {
+    type RequestBody = ();
+    type ResponseBody = ();
+
+    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmBeginForkTracking");
+
+            let response = vmm
+                .vm_begin_fork_tracking()
+                .map_err(ApiError::VmBeginForkTracking)
+                .map(|_| ApiResponsePayload::Empty);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        match get_response(self, api_evt, api_sender, data)? {
+            ApiResponsePayload::Empty => Ok(()),
+            _ => Err(ApiError::ResponsePayloadType),
+        }
+    }
+}
+
+pub struct VmCaptureForkState;
+
+impl ApiAction for VmCaptureForkState {
+    type RequestBody = ();
+    type ResponseBody = VmForkStateCapture;
+
+    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmCaptureForkState");
+
+            let response = vmm
+                .vm_capture_fork_state()
+                .map_err(ApiError::VmCaptureForkState)
+                .map(ApiResponsePayload::VmForkState);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        match get_response(self, api_evt, api_sender, data)? {
+            ApiResponsePayload::VmForkState(capture) => Ok(capture),
+            _ => Err(ApiError::ResponsePayloadType),
+        }
+    }
+}
+
+pub struct VmRestoreForkState;
+
+impl ApiAction for VmRestoreForkState {
+    type RequestBody = VmRestoreForkStateData;
+    type ResponseBody = ();
+
+    fn request(&self, data: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmRestoreForkState");
+
+            let response = vmm
+                .vm_restore_fork_state(data)
+                .map_err(ApiError::VmRestoreForkState)
+                .map(|_| ApiResponsePayload::Empty);
+
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        match get_response(self, api_evt, api_sender, data)? {
+            ApiResponsePayload::Empty => Ok(()),
+            _ => Err(ApiError::ResponsePayloadType),
+        }
     }
 }
 

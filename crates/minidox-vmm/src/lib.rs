@@ -12,6 +12,8 @@ mod ram;
 mod supervisor;
 
 #[cfg(target_os = "linux")]
+pub use cloud_hypervisor::api::VmForkStateCapture;
+#[cfg(target_os = "linux")]
 pub use linux::{CloudHypervisorVm, VmConfig};
 #[cfg(target_os = "linux")]
 pub use ram::{KvmGuestRam, RAM_PAGE_SIZE, RamAccounting};
@@ -44,6 +46,10 @@ pub enum Error {
     /// A host RAM access exceeded the guest memory slot.
     #[error("guest RAM range offset={offset} length={len} is out of bounds")]
     RamRange { offset: usize, len: usize },
+
+    /// A VMM dirty-page capture referred to memory outside this RAM branch.
+    #[error("dirty RAM page {page} is outside the {pages}-page guest mapping")]
+    InvalidDirtyPage { page: usize, pages: usize },
 }
 
 impl Error {

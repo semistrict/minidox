@@ -31,6 +31,7 @@ fn kvm_dirty_pages_form_recursive_cow_ram_branches() {
     let first_fork = KvmGuestRam::page_accounting([&source_ram, &child]);
     assert_eq!(first_fork.resident_pages, 3);
     assert_eq!(first_fork.shared_pages, 3);
+    assert_eq!(first_fork.backing_files, 1);
 
     source_ram.write(0, &guest_program(84)).unwrap();
     run_from_start(vcpu.as_mut());
@@ -43,6 +44,7 @@ fn kvm_dirty_pages_form_recursive_cow_ram_branches() {
     let recursive = KvmGuestRam::page_accounting([&source_ram, &child, &grandchild]);
     assert_eq!(recursive.resident_pages, 5);
     assert_eq!(recursive.shared_pages, 3);
+    assert_eq!(recursive.backing_files, 2);
 
     source_ram
         .unregister(source_vm.as_ref(), SLOT, GPA)

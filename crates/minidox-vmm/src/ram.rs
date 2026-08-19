@@ -15,31 +15,41 @@ use crate::Error;
 pub const RAM_PAGE_SIZE: usize = 4096;
 
 static NEXT_PAGE_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_GENERATION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
-struct RamPage {
+struct RamGeneration {
     id: u64,
     file: File,
 }
 
-impl RamPage {
-    fn zeroed() -> Result<Arc<Self>, Error> {
+impl RamGeneration {
+    fn zeroed(len: usize) -> Result<Arc<Self>, Error> {
         let file =
-            tempfile::tempfile().map_err(|error| Error::backend("create RAM page", error))?;
-        file.set_len(RAM_PAGE_SIZE as u64)
-            .map_err(|error| Error::backend("size RAM page", error))?;
+            tempfile::tempfile().map_err(|error| Error::backend("create RAM generation", error))?;
+        file.set_len(len as u64)
+            .map_err(|error| Error::backend("size RAM generation", error))?;
         Ok(Arc::new(Self {
-            id: NEXT_PAGE_ID.fetch_add(1, Ordering::Relaxed),
+            id: NEXT_GENERATION_ID.fetch_add(1, Ordering::Relaxed),
             file,
         }))
     }
+}
 
-    fn from_bytes(bytes: &[u8]) -> Result<Arc<Self>, Error> {
-        let page = Self::zeroed()?;
-        page.file
-            .write_all_at(bytes, 0)
-            .map_err(|error| Error::backend("write RAM page", error))?;
-        Ok(page)
+#[derive(Debug)]
+struct RamPage {
+    id: u64,
+    generation: Arc<RamGeneration>,
+    offset: u64,
+}
+
+impl RamPage {
+    fn new(generation: Arc<RamGeneration>, offset: u64) -> Arc<Self> {
+        Arc::new(Self {
+            id: NEXT_PAGE_ID.fetch_add(1, Ordering::Relaxed),
+            generation,
+            offset,
+        })
     }
 }
 
@@ -47,6 +57,7 @@ impl RamPage {
 pub struct RamAccounting {
     pub resident_pages: usize,
     pub shared_pages: usize,
+    pub backing_files: usize,
 }
 
 /// A contiguous KVM memory slot backed by page-granular immutable generations.
@@ -77,8 +88,9 @@ impl KvmGuestRam {
             private: false,
         };
 
+        let generation = RamGeneration::zeroed(len)?;
         for index in 0..len / RAM_PAGE_SIZE {
-            let page = RamPage::zeroed()?;
+            let page = RamPage::new(Arc::clone(&generation), (index * RAM_PAGE_SIZE) as u64);
             ram.map_page(index, &page, false)?;
             ram.pages.push(page);
         }
@@ -192,9 +204,34 @@ impl KvmGuestRam {
             }
         }
 
+        self.fork_pages(dirty)
+    }
+
+    /// Fork using dirty host-page indexes captured by the embedded VMM.
+    pub fn fork_dirty_pages(&mut self, pages: &[usize]) -> Result<Self, Error> {
+        let mut dirty = self.host_dirty.clone();
+        for &page in pages {
+            if page >= self.pages.len() {
+                return Err(Error::InvalidDirtyPage {
+                    page,
+                    pages: self.pages.len(),
+                });
+            }
+            dirty.insert(page);
+        }
+        self.fork_pages(dirty)
+    }
+
+    fn fork_pages(&mut self, dirty: BTreeSet<usize>) -> Result<Self, Error> {
         if self.private {
-            for index in dirty {
-                let page = RamPage::from_bytes(self.page_bytes(index))?;
+            let generation = RamGeneration::zeroed(dirty.len() * RAM_PAGE_SIZE)?;
+            for (generation_index, index) in dirty.into_iter().enumerate() {
+                let offset = (generation_index * RAM_PAGE_SIZE) as u64;
+                generation
+                    .file
+                    .write_all_at(self.page_bytes(index), offset)
+                    .map_err(|error| Error::backend("write RAM generation page", error))?;
+                let page = RamPage::new(Arc::clone(&generation), offset);
                 self.map_page(index, &page, true)?;
                 self.pages[index] = page;
             }
@@ -212,7 +249,11 @@ impl KvmGuestRam {
 
     pub fn page_accounting<'a>(branches: impl IntoIterator<Item = &'a Self>) -> RamAccounting {
         let mut references = BTreeMap::<u64, usize>::new();
+        let mut backing_files = BTreeSet::new();
         for branch in branches {
+            for page in &branch.pages {
+                backing_files.insert(page.generation.id);
+            }
             for id in branch
                 .pages
                 .iter()
@@ -225,6 +266,7 @@ impl KvmGuestRam {
         RamAccounting {
             resident_pages: references.len(),
             shared_pages: references.values().filter(|&&count| count > 1).count(),
+            backing_files: backing_files.len(),
         }
     }
 
@@ -261,8 +303,8 @@ impl KvmGuestRam {
                 RAM_PAGE_SIZE,
                 libc::PROT_READ | libc::PROT_WRITE,
                 flags,
-                page.file.as_raw_fd(),
-                0,
+                page.generation.file.as_raw_fd(),
+                page.offset as libc::off_t,
             )
         };
         if mapped == libc::MAP_FAILED {
