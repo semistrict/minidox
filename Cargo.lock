@@ -1010,8 +1010,10 @@ name = "minidox-vmm"
 version = "0.1.0"
 dependencies = [
  "hypervisor",
+ "libc",
  "seccompiler",
  "serde_json",
+ "tempfile",
  "thiserror",
  "vmm",
  "vmm-sys-util",

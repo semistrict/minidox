@@ -6,9 +6,13 @@
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod ram;
 
 #[cfg(target_os = "linux")]
 pub use linux::{CloudHypervisorVm, VmConfig};
+#[cfg(target_os = "linux")]
+pub use ram::{KvmGuestRam, RAM_PAGE_SIZE, RamAccounting};
 
 /// Whether this build can instantiate the KVM-backed VMM.
 pub const fn is_supported_host() -> bool {
@@ -28,6 +32,14 @@ pub enum Error {
     /// The VMM worker panicked.
     #[error("Cloud Hypervisor VMM worker panicked")]
     WorkerPanicked,
+
+    /// Guest RAM must consist of one or more complete base pages.
+    #[error("invalid guest RAM size {0}")]
+    InvalidRamSize(usize),
+
+    /// A host RAM access exceeded the guest memory slot.
+    #[error("guest RAM range offset={offset} length={len} is out of bounds")]
+    RamRange { offset: usize, len: usize },
 }
 
 impl Error {
@@ -41,10 +53,7 @@ impl Error {
             source = cause.source();
         }
 
-        Self::Backend {
-            operation,
-            message,
-        }
+        Self::Backend { operation, message }
     }
 }
 
