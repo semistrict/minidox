@@ -1,0 +1,289 @@
+use alloc::{borrow::ToOwned, string::String, vec::Vec};
+use core::{ascii, fmt::Debug};
+
+use super::{
+    copy_path_to_buf,
+    data::{Map, Stat, TimeSpec},
+    flag::*,
+    number::*,
+    usercopy::UserSlice,
+};
+
+use crate::{sync::CleanLockToken, syscall::error::Result};
+
+struct ByteStr<'a>(&'a [u8]);
+
+impl Debug for ByteStr<'_> {
+    fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+        write!(f, "\"")?;
+        for i in self.0 {
+            for ch in ascii::escape_default(*i) {
+                write!(f, "{}", ch as char)?;
+            }
+        }
+        write!(f, "\"")?;
+        Ok(())
+    }
+}
+fn debug_path(ptr: usize, len: usize) -> Result<String> {
+    // TODO: PATH_MAX
+    UserSlice::ro(ptr, len).and_then(|slice| copy_path_to_buf(slice, 4096))
+}
+fn debug_buf(ptr: usize, len: usize) -> Result<Vec<u8>> {
+    UserSlice::ro(ptr, len).and_then(|user| {
+        let mut buf = vec![0_u8; 4096];
+        let count = user.copy_common_bytes_to_slice(&mut buf)?;
+        buf.truncate(count);
+        Ok(buf)
+    })
+}
+unsafe fn read_struct<T>(ptr: usize) -> Result<T> {
+    unsafe { UserSlice::ro(ptr, size_of::<T>()).and_then(|slice| slice.read_exact::<T>()) }
+}
+
+//TODO: calling format_call with arguments from another process space will not work
+pub fn format_call(a: usize, b: usize, c: usize, d: usize, e: usize, f: usize, g: usize) -> String {
+    match a {
+        SYS_OPENAT_INTO => format!(
+            "openat_into({} {:?}, {:#0x}, {}, out: {})",
+            b,
+            debug_path(c, d).as_ref().map(|p| ByteStr(p.as_bytes())),
+            e,
+            f,
+            g
+        ),
+        SYS_UNLINKAT => format!(
+            "unlinkat({} {:?}, {:#0x}, {}, {})",
+            b,
+            debug_path(c, d).as_ref().map(|p| ByteStr(p.as_bytes())),
+            e,
+            f,
+            g,
+        ),
+        SYS_CLOSE => format!("close({})", b),
+        SYS_DUP_INTO => format!(
+            "dup_into({}, {:?}, out: {})",
+            b,
+            debug_buf(c, d).as_ref().map(|b| ByteStr(b)),
+            e,
+        ),
+        SYS_DUP2 => format!(
+            "dup2({}, {}, {:?})",
+            b,
+            c,
+            debug_buf(d, e).as_ref().map(|b| ByteStr(b)),
+        ),
+        SYS_READ => format!("read({}, {:#X}, {})", b, c, d),
+        SYS_READ2 => format!(
+            "read2({}, {:#X}, {}, {}, {:?})",
+            b,
+            c,
+            d,
+            e,
+            (f != usize::MAX).then_some(RwFlags::from_bits_retain(f as u32))
+        ),
+        SYS_WRITE => format!("write({}, {:#X}, {})", b, c, d),
+        SYS_WRITE2 => format!(
+            "write2({}, {:#X}, {}, {}, {:?})",
+            b,
+            c,
+            d,
+            e,
+            (f != usize::MAX).then_some(RwFlags::from_bits_retain(f as u32))
+        ),
+        SYS_LSEEK => format!(
+            "lseek({}, {}, {} ({}))",
+            b,
+            c as isize,
+            match d {
+                SEEK_SET => "SEEK_SET",
+                SEEK_CUR => "SEEK_CUR",
+                SEEK_END => "SEEK_END",
+                _ => "UNKNOWN",
+            },
+            d
+        ),
+        SYS_FCHOWN => format!("fchown({}, {}, {})", b, c, d),
+        SYS_FCNTL => format!(
+            "fcntl({}, {} ({}), {:#X})",
+            b,
+            match c {
+                F_DUPFD => "F_DUPFD",
+                F_GETFD => "F_GETFD",
+                F_SETFD => "F_SETFD",
+                F_SETFL => "F_SETFL",
+                F_GETFL => "F_GETFL",
+                _ => "UNKNOWN",
+            },
+            c,
+            d
+        ),
+        SYS_FMAP => format!(
+            "fmap({}, {:?})",
+            b,
+            UserSlice::ro(c, d).and_then(|buf| unsafe { buf.read_exact::<Map>() }),
+        ),
+        SYS_FUNMAP => format!("funmap({:#X}, {:#X})", b, c,),
+        SYS_FLINK => format!("flink({}, {:?})", b, debug_path(c, d),),
+        SYS_FPATH => format!("fpath({}, {:#X}, {})", b, c, d),
+        SYS_FRENAME => format!("frename({}, {:?})", b, debug_path(c, d),),
+        SYS_FSTAT => format!(
+            "fstat({}, {:?})",
+            b,
+            UserSlice::ro(c, d).and_then(|buf| unsafe { buf.read_exact::<Stat>() }),
+        ),
+        SYS_FSYNC => format!("fsync({})", b),
+        SYS_CALL => format!(
+            "call({b}, {c:x}+{d}, {:?}, {:0x?}",
+            CallFlags::from_bits_retain(e & !0xff),
+            // TODO: u64
+            UserSlice::ro(f, (e & 0xff) * 8)
+                .and_then(|buf| buf.usizes().collect::<Result<Vec<usize>>>()),
+        ),
+
+        SYS_CLOCK_GETTIME => format!("clock_gettime({}, {:?})", b, unsafe {
+            read_struct::<TimeSpec>(c)
+        }),
+        SYS_FUTEX => format!(
+            "futex({:#X} [{:?}], {}, {}, {}, {})",
+            b,
+            UserSlice::ro(b, 4).and_then(|buf| buf.read_u32()),
+            c,
+            d,
+            e,
+            f
+        ),
+        SYS_MPROTECT => format!("mprotect({:#X}, {}, {:?})", b, c, MapFlags::from_bits(d)),
+        SYS_MREMAP => format!("mremap({:#X}, {:#X}, {:#X}, {:#X}, {:#X})", b, c, d, e, f),
+        SYS_NANOSLEEP => format!(
+            "nanosleep({:?}, ({}, {}))",
+            unsafe { read_struct::<TimeSpec>(b) },
+            c,
+            d
+        ),
+        SYS_YIELD => "yield()".to_owned(),
+        _ => format!(
+            "UNKNOWN{} {:#X}({:#X}, {:#X}, {:#X}, {:#X}, {:#X}, {:#X})",
+            a, a, b, c, d, e, f, g
+        ),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SyscallDebugInfo {
+    this_switch_time: u128,
+    accumulated_time: u128,
+    do_debug: bool,
+}
+impl SyscallDebugInfo {
+    pub const fn default() -> Self {
+        Self {
+            this_switch_time: 0,
+            accumulated_time: 0,
+            do_debug: false,
+        }
+    }
+
+    #[cfg(feature = "syscall_debug")]
+    pub fn on_switch_from(&mut self, token: &mut CleanLockToken) {
+        let now = crate::time::monotonic(token);
+        self.accumulated_time += now - core::mem::replace(&mut self.this_switch_time, now);
+    }
+    #[cfg(feature = "syscall_debug")]
+    pub fn on_switch_to(&mut self, token: &mut CleanLockToken) {
+        self.this_switch_time = crate::time::monotonic(token);
+    }
+}
+
+#[cfg_attr(feature = "syscall_debug", inline)]
+pub fn debug_start([a, b, c, d, e, f, g]: [usize; 7], token: &mut CleanLockToken) {
+    if cfg!(not(feature = "syscall_debug")) {
+        return;
+    }
+
+    #[expect(clippy::overly_complex_bool_expr)]
+    #[expect(clippy::needless_bool)]
+    let do_debug = if true && {
+        let ctx = crate::context::current();
+        let guard = ctx.read(token.token());
+        guard.name.contains("init") || guard.name.contains("bootstrap")
+    } {
+        if a == SYS_CLOCK_GETTIME || a == SYS_YIELD || a == SYS_FUTEX {
+            false
+        } else if (a == SYS_WRITE || a == SYS_FSYNC) && (b == 1 || b == 2) {
+            false
+        } else {
+            true
+        }
+    } else {
+        false
+    };
+
+    let debug_start = if do_debug {
+        let context_lock = crate::context::current();
+        {
+            let context = context_lock.read(token.token());
+            print!("{} (*{}*): ", context.name, context.pid,);
+        }
+
+        // Do format_call outside print! so possible exception handlers cannot reentrantly
+        // deadlock.
+        let string = format_call(a, b, c, d, e, f, g);
+        println!("{}", string);
+
+        crate::time::monotonic(token)
+    } else {
+        0
+    };
+
+    crate::percpu::PercpuBlock::current()
+        .syscall_debug_info
+        .set(SyscallDebugInfo {
+            accumulated_time: 0,
+            this_switch_time: debug_start,
+            do_debug,
+        });
+}
+
+#[cfg_attr(feature = "syscall_debug", inline)]
+pub fn debug_end(
+    [a, b, c, d, e, f, g]: [usize; 7],
+    result: Result<usize>,
+    token: &mut CleanLockToken,
+) {
+    if cfg!(not(feature = "syscall_debug")) {
+        return;
+    }
+
+    let debug_info = crate::percpu::PercpuBlock::current()
+        .syscall_debug_info
+        .take();
+
+    if !debug_info.do_debug {
+        return;
+    }
+    let debug_duration =
+        debug_info.accumulated_time + (crate::time::monotonic(token) - debug_info.this_switch_time);
+
+    let context_lock = crate::context::current();
+    {
+        let context = context_lock.read(token.token());
+        print!("{} (*{}*): ", context.name, context.pid,);
+    }
+
+    // Do format_call outside print! so possible exception handlers cannot reentrantly
+    // deadlock.
+    let string = format_call(a, b, c, d, e, f, g);
+    print!("{} = ", string);
+
+    match result {
+        Ok(ref ok) => {
+            print!("Ok({} ({:#X}))", ok, ok);
+        }
+        Err(ref err) => {
+            print!("Err({} ({:#X}))", err, err.errno);
+        }
+    }
+
+    println!(" in {} ns", debug_duration);
+}

@@ -1,0 +1,243 @@
+//! # ACPI
+//! Code to parse the ACPI tables
+
+use core::ptr::NonNull;
+
+use alloc::{boxed::Box, string::String, vec::Vec};
+
+use hashbrown::HashMap;
+use rmm::{BumpAllocator, FrameAllocator, PageMapper};
+use spin::{Once, RwLock};
+
+use crate::{
+    acpi::rxsdt::RxsdtIter,
+    memory::{KernelMapper, PageFlags, PhysicalAddress, RmmA, RmmArch},
+};
+
+use self::{hpet::Hpet, madt::Madt, rsdp::Rsdp, rsdt::Rsdt, rxsdt::Rxsdt, sdt::Sdt, xsdt::Xsdt};
+
+#[cfg(target_arch = "aarch64")]
+mod gtdt;
+pub mod hpet;
+pub mod madt;
+mod rsdp;
+mod rsdt;
+mod rxsdt;
+pub mod sdt;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+pub mod slit;
+#[cfg(target_arch = "aarch64")]
+mod spcr;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+pub mod srat;
+mod xsdt;
+
+unsafe fn map_linearly(
+    addr: PhysicalAddress,
+    len: usize,
+    mapper: &mut PageMapper<RmmA, impl FrameAllocator>,
+) {
+    unsafe {
+        let base = PhysicalAddress::new(crate::memory::round_down_pages(addr.data()));
+        let aligned_len = crate::memory::round_up_pages(len + (addr.data() - base.data()));
+
+        for page_idx in 0..aligned_len / crate::memory::PAGE_SIZE {
+            let (_, flush) = mapper
+                .map_linearly(
+                    base.add(page_idx * crate::memory::PAGE_SIZE),
+                    PageFlags::new(),
+                )
+                .expect("failed to linearly map SDT");
+            flush.flush();
+        }
+    }
+}
+
+pub fn get_sdt(
+    sdt_address: PhysicalAddress,
+    mapper: &mut PageMapper<RmmA, impl FrameAllocator>,
+) -> &'static Sdt {
+    let sdt;
+
+    unsafe {
+        const SDT_SIZE: usize = size_of::<Sdt>();
+        map_linearly(sdt_address, SDT_SIZE, mapper);
+
+        sdt = &*(RmmA::phys_to_virt(sdt_address).data() as *const Sdt);
+
+        map_linearly(
+            sdt_address.add(SDT_SIZE),
+            sdt.length as usize - SDT_SIZE,
+            mapper,
+        );
+    }
+    sdt
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GenericAddressStructure {
+    pub address_space: u8,
+    pub bit_width: u8,
+    pub bit_offset: u8,
+    pub access_size: u8,
+    pub address: u64,
+}
+
+pub enum RxsdtEnum {
+    Rsdt(Rsdt),
+    Xsdt(Xsdt),
+}
+impl Rxsdt for RxsdtEnum {
+    fn iter(&self) -> RxsdtIter {
+        match self {
+            Self::Rsdt(rsdt) => rsdt.iter(),
+            Self::Xsdt(xsdt) => xsdt.iter(),
+        }
+    }
+}
+
+pub static RXSDT_ENUM: Once<RxsdtEnum> = Once::new();
+
+/// Initialises the global `RXSDT_ENUM` if RSDT or XSDT was found and maps the SDT pages.
+///
+/// It does not use `TheFrameAllocator` nor does it heap-allocate.
+pub unsafe fn init_before_mem(
+    already_supplied_rsdp: Option<NonNull<u8>>,
+    mapper: &mut PageMapper<RmmA, BumpAllocator<RmmA>>,
+) {
+    unsafe {
+        // Search for RSDP
+        let rsdp_opt = Rsdp::get_rsdp(already_supplied_rsdp);
+
+        if let Some(rsdp) = rsdp_opt {
+            debug!("SDT address: {:#x}", rsdp.sdt_address().data());
+            let rxsdt = get_sdt(rsdp.sdt_address(), mapper);
+
+            let rxsdt = if let Some(rsdt) = Rsdt::new(rxsdt) {
+                let mut initialized = false;
+
+                let rsdt = RXSDT_ENUM.call_once(|| {
+                    initialized = true;
+
+                    RxsdtEnum::Rsdt(rsdt)
+                });
+
+                if !initialized {
+                    error!("RXSDT_ENUM already initialized");
+                }
+
+                rsdt
+            } else if let Some(xsdt) = Xsdt::new(rxsdt) {
+                let mut initialized = false;
+
+                let xsdt = RXSDT_ENUM.call_once(|| {
+                    initialized = true;
+
+                    RxsdtEnum::Xsdt(xsdt)
+                });
+                if !initialized {
+                    error!("RXSDT_ENUM already initialized");
+                }
+
+                xsdt
+            } else {
+                warn!("UNKNOWN RSDT OR XSDT SIGNATURE");
+                return;
+            };
+
+            // TODO: Don't touch ACPI tables in kernel?
+
+            for sdt in rxsdt.iter() {
+                get_sdt(sdt, mapper);
+            }
+        } else {
+            error!("NO RSDP FOUND");
+            return;
+        }
+    }
+}
+
+/// Parse the ACPI tables to gather CPU, interrupt, and timer information. The code performs allocations, so
+/// it must be called only after the allocator is set up.
+pub unsafe fn init_after_mem(already_supplied_rsdp: Option<NonNull<u8>>) {
+    if let Some(rxsdt) = RXSDT_ENUM.get() {
+        unsafe {
+            {
+                let mut sdt_ptrs = SDT_POINTERS.write();
+                *sdt_ptrs = Some(HashMap::new());
+            }
+
+            for sdt_address in rxsdt.iter() {
+                let sdt = &*(RmmA::phys_to_virt(sdt_address).data() as *const Sdt);
+
+                let signature = get_sdt_signature(sdt);
+                if let Some(ref mut ptrs) = *(SDT_POINTERS.write()) {
+                    ptrs.insert(signature, sdt);
+                }
+            }
+
+            // TODO: Enumerate processors in userspace, and then provide an ACPI-independent interface
+            // to initialize enumerated processors to userspace?
+            Madt::init();
+            //TODO: support this on any arch
+            // SPCR must be initialized after MADT for interrupt controllers
+            #[cfg(target_arch = "aarch64")]
+            spcr::Spcr::init();
+            // TODO: Let userspace setup HPET, and then provide an interface to specify which timer to
+            // use?
+            Hpet::init();
+            #[cfg(target_arch = "aarch64")]
+            gtdt::Gtdt::init();
+        }
+    }
+}
+
+pub type SdtSignature = (String, [u8; 6], [u8; 8]);
+pub static SDT_POINTERS: RwLock<Option<HashMap<SdtSignature, &'static Sdt>>> = RwLock::new(None);
+
+pub fn find_sdt(name: &str) -> Vec<&'static Sdt> {
+    let mut sdts: Vec<&'static Sdt> = vec![];
+
+    if let Some(ref ptrs) = *(SDT_POINTERS.read()) {
+        for (signature, sdt) in ptrs {
+            if signature.0 == name {
+                sdts.push(sdt);
+            }
+        }
+    }
+
+    sdts
+}
+
+#[macro_export]
+macro_rules! find_one_sdt {
+    ($name:expr) => {{
+        use $crate::acpi::find_sdt;
+        match find_sdt($name).as_slice() {
+            [] => {
+                println!("Unable to find {}", $name);
+                return;
+            }
+            [x] => *x,
+            x => {
+                println!("{} {} found, expected 1", x.len(), $name);
+                return;
+            }
+        }
+    }};
+}
+
+pub fn get_sdt_signature(sdt: &'static Sdt) -> SdtSignature {
+    let signature =
+        String::from_utf8(sdt.signature.to_vec()).expect("Error converting signature to string");
+    (signature, sdt.oem_id, sdt.oem_table_id)
+}
+
+pub struct Acpi {
+    pub hpet: RwLock<Option<Hpet>>,
+}
+
+pub static ACPI_TABLE: Acpi = Acpi {
+    hpet: RwLock::new(None),
+};

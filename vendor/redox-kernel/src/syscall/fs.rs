@@ -1,0 +1,809 @@
+//! Filesystem syscalls
+
+use core::num::NonZeroUsize;
+
+use alloc::{string::String, sync::Arc, vec::Vec};
+use redox_path::RedoxPath;
+
+use crate::{
+    context::{
+        self,
+        file::{FileDescription, FileDescriptor, InternalFlags, LockedFileDescription},
+        memory::{
+            handle_notify_files, AddrSpace, GenericFlusher, Grant, PageSpan, TlbShootdownActions,
+        },
+    },
+    memory::{Page, VirtualAddress, PAGE_SIZE},
+    scheme::{self, FileHandle, KernelScheme, OpenResult, StrOrBytes},
+    sync::{CleanLockToken, RwLock},
+    syscall::{data::Stat, error::*, flag::*},
+};
+
+use super::usercopy::{UserSlice, UserSliceRo, UserSliceRw, UserSliceWo};
+
+pub fn file_op_generic<T>(
+    fd: FileHandle,
+    token: &mut CleanLockToken,
+    op: impl FnOnce(&dyn KernelScheme, usize, &mut CleanLockToken) -> Result<T>,
+) -> Result<T> {
+    file_op_generic_ext(fd, token, |s, _, desc, token| op(s, desc.number, token))
+}
+pub fn file_op_generic_ext<T>(
+    fd: FileHandle,
+    token: &mut CleanLockToken,
+    op: impl FnOnce(
+        &dyn KernelScheme,
+        Arc<LockedFileDescription>,
+        FileDescription,
+        &mut CleanLockToken,
+    ) -> Result<T>,
+) -> Result<T> {
+    let (file, desc) = {
+        let current_lock = context::current();
+        let mut current = current_lock.read(token.token());
+        let (context, mut token) = current.token_split();
+        let file = context.get_file(fd, &mut token).ok_or(Error::new(EBADF))?;
+        let desc = *file.description.read(token.token());
+        (file, desc)
+    };
+
+    let scheme = scheme::get_scheme(token.token(), desc.scheme)?;
+
+    op(&*scheme, file.description, desc, token)
+}
+pub fn copy_path_to_buf(raw_path: UserSliceRo, max_len: usize) -> Result<String> {
+    let mut path_buf = vec![0_u8; max_len];
+    if raw_path.len() > path_buf.len() {
+        return Err(Error::new(ENAMETOOLONG));
+    }
+    let path_len = raw_path.copy_common_bytes_to_slice(&mut path_buf)?;
+    path_buf.truncate(path_len);
+    String::from_utf8(path_buf).map_err(|_| Error::new(EINVAL))
+    //core::str::from_utf8(&path_buf[..path_len]).map_err(|_| Error::new(EINVAL))
+}
+// TODO: Define elsewhere
+const PATH_MAX: usize = PAGE_SIZE;
+
+pub fn openat_into(
+    fh: FileHandle,
+    raw_path: UserSliceRo,
+    flags: usize,
+    fcntl_flags: u32,
+    new_fd: FileHandle,
+    token: &mut CleanLockToken,
+) -> Result<FileHandle> {
+    let path_buf = copy_path_to_buf(raw_path, PATH_MAX)?;
+
+    let (scheme_id, number) = {
+        let current_lock = context::current();
+        let mut current = current_lock.read(token.token());
+        let (context, mut token) = current.token_split();
+        let pipe = context.get_file(fh, &mut token).ok_or(Error::new(EBADF))?;
+        let desc = pipe.description.read(token.token());
+        (desc.scheme, desc.number)
+    };
+
+    let caller_ctx = context::current().read(token.token()).caller_ctx();
+
+    let new_description = {
+        let scheme = scheme::get_scheme(token.token(), scheme_id)?;
+
+        let res = scheme.kopenat(
+            number,
+            StrOrBytes::from_str(&path_buf),
+            flags,
+            fcntl_flags,
+            caller_ctx,
+            token,
+        );
+
+        match res? {
+            OpenResult::SchemeLocal(number, internal_flags) => {
+                Arc::new(RwLock::new(FileDescription {
+                    offset: 0,
+                    internal_flags,
+                    scheme: scheme_id,
+                    number,
+                    flags: flags as u32,
+                }))
+            }
+            OpenResult::External(desc) => desc,
+        }
+    };
+
+    let current_lock = context::current();
+    let mut current = current_lock.read(token.token());
+    let (context, mut token) = current.token_split();
+    context
+        .insert_file(
+            new_fd,
+            FileDescriptor {
+                description: new_description,
+            },
+            &mut token,
+        )
+        .ok_or(Error::new(EEXIST))
+}
+/// Unlinkat syscall
+pub fn unlinkat(
+    fh: FileHandle,
+    raw_path: UserSliceRo,
+    flags: usize,
+    token: &mut CleanLockToken,
+) -> Result<()> {
+    let path_buf = copy_path_to_buf(raw_path, PATH_MAX)?;
+
+    let (number, scheme_id) = {
+        let current_lock = context::current();
+        let mut current = current_lock.read(token.token());
+        let (context, mut token) = current.token_split();
+        let pipe = context.get_file(fh, &mut token).ok_or(Error::new(EBADF))?;
+        let desc = pipe.description.read(token.token());
+        (desc.number, desc.scheme)
+    };
+
+    let scheme = scheme::get_scheme(token.token(), scheme_id)?;
+
+    let caller_ctx = context::current().read(token.token()).caller_ctx();
+
+    /*
+    let mut path_buf = BorrowedHtBuf::head()?;
+    let path = path_buf.use_for_string(raw_path)?;
+    */
+    scheme.unlinkat(number, &path_buf, flags, caller_ctx, token)
+}
+
+/// Close syscall
+pub fn close(fd: FileHandle, token: &mut CleanLockToken) -> Result<()> {
+    let file = {
+        let current_lock = context::current();
+        let mut current = current_lock.read(token.token());
+        let (context, mut token) = current.token_split();
+        context
+            .remove_file(fd, &mut token)
+            .ok_or(Error::new(EBADF))?
+    };
+
+    file.close(token)
+}
+
+fn duplicate_file(
+    fd: FileHandle,
+    user_buf: UserSliceRo,
+    token: &mut CleanLockToken,
+) -> Result<FileDescriptor> {
+    let (caller_ctx, file) = {
+        let current_lock = context::current();
+        let mut current = current_lock.read(token.token());
+        let (context, mut token) = current.token_split();
+        (
+            context.caller_ctx(),
+            context.get_file(fd, &mut token).ok_or(Error::new(EBADF))?,
+        )
+    };
+
+    if user_buf.is_empty() {
+        Ok(FileDescriptor {
+            description: Arc::clone(&file.description),
+        })
+    } else {
+        let description = { *file.description.read(token.token()) };
+
+        let new_description = {
+            let scheme = scheme::get_scheme(token.token(), description.scheme)?;
+
+            match scheme.kdup(description.number, user_buf, caller_ctx, token)? {
+                OpenResult::SchemeLocal(number, internal_flags) => {
+                    Arc::new(RwLock::new(FileDescription {
+                        offset: 0,
+                        internal_flags,
+                        scheme: description.scheme,
+                        number,
+                        flags: description.flags,
+                    }))
+                }
+                OpenResult::External(desc) => desc,
+            }
+        };
+
+        Ok(FileDescriptor {
+            description: new_description,
+        })
+    }
+}
+
+/// Duplicate file descriptor
+pub fn dup_into(
+    fd: FileHandle,
+    new_fd: FileHandle,
+    buf: UserSliceRo,
+    token: &mut CleanLockToken,
+) -> Result<FileHandle> {
+    let new_file = duplicate_file(fd, buf, token)?;
+    let current_lock = context::current();
+    let mut current = current_lock.read(token.token());
+    let (context, mut token) = current.token_split();
+    context
+        .insert_file(new_fd, new_file, &mut token)
+        .ok_or(Error::new(EEXIST))
+}
+
+/// Duplicate file descriptor, replacing another
+pub fn dup2(
+    fd: FileHandle,
+    new_fd: FileHandle,
+    buf: UserSliceRo,
+    token: &mut CleanLockToken,
+) -> Result<FileHandle> {
+    if fd == new_fd && buf.is_empty() {
+        return Ok(new_fd);
+    }
+
+    let new_file = duplicate_file(fd, buf, token)?;
+
+    let old_file = {
+        let current_lock = context::current();
+        let mut current = current_lock.write(token.token());
+        let (context, mut split_token) = current.token_split();
+
+        let old_file = context.remove_file(new_fd, &mut split_token.token());
+
+        if context
+            .insert_file(new_fd, new_file, &mut split_token.token())
+            .is_none()
+        {
+            if let Some(old) = old_file {
+                context.insert_file(new_fd, old, &mut split_token.token());
+            }
+            return Err(Error::new(EMFILE));
+        }
+        old_file
+    };
+
+    if let Some(old) = old_file {
+        let _ = old.close(token);
+    }
+
+    Ok(new_fd)
+}
+pub fn call(
+    fds: &[usize],
+    payload: UserSliceRw,
+    flags: CallFlags,
+    metadata: UserSliceRo,
+    token: &mut CleanLockToken,
+) -> Result<usize> {
+    let mut meta = [0_u64; 3];
+
+    // TODO: bytemuck/plain
+    let copied = metadata.copy_common_bytes_to_slice(unsafe {
+        core::slice::from_raw_parts_mut(meta.as_mut_ptr().cast(), meta.len() * 8)
+    })?;
+
+    match flags {
+        f if f.contains(CallFlags::WRITE | CallFlags::FD) => {
+            if fds.len() != 1 {
+                return Err(Error::new(EINVAL));
+            }
+            call_fdwrite(
+                FileHandle::from(fds[0]),
+                payload,
+                flags,
+                &meta[..copied / 8],
+                token,
+            )
+        }
+        f if f.contains(CallFlags::READ | CallFlags::FD) => {
+            if fds.len() != 1 {
+                return Err(Error::new(EINVAL));
+            }
+            call_fdread(
+                FileHandle::from(fds[0]),
+                payload,
+                flags,
+                &meta[..copied / 8],
+                token,
+            )
+        }
+        _ => call_normal(fds, payload, flags, &meta[..copied / 8], token),
+    }
+}
+
+fn call_normal(
+    fds: &[usize],
+    payload: UserSliceRw,
+    flags: CallFlags,
+    metadata: &[u64],
+    token: &mut CleanLockToken,
+) -> Result<usize> {
+    if fds.len() > 2 || fds.is_empty() {
+        return Err(Error::new(EINVAL));
+    }
+
+    let mut nums = arrayvec::ArrayVec::<_, 2>::new();
+
+    let current_lock = context::current();
+    let consume = flags.contains(CallFlags::CONSUME);
+    let mut fds = fds.iter();
+
+    let (target_file, scheme_id) = {
+        let fd = FileHandle::from(fds.next().copied().unwrap());
+        let mut current = current_lock.read(token.token());
+
+        let (file, mut split_token) = match (current.token_split(), consume) {
+            ((ctxt, mut split_token), true) => {
+                (ctxt.remove_file(fd, &mut split_token), split_token)
+            }
+            ((ctxt, mut split_token), false) => (ctxt.get_file(fd, &mut split_token), split_token),
+        };
+        let file = file.ok_or(Error::new(EBADF))?;
+
+        let desc = file.description.read(split_token.token());
+
+        let scheme_id = desc.scheme;
+        nums.push(desc.number);
+        drop(desc);
+        let target_file = file;
+        (target_file, scheme_id)
+    };
+
+    for &fd in fds {
+        let fd = FileHandle::from(fd);
+        let mut current = current_lock.read(token.token());
+
+        let (file, mut split_token) = match (current.token_split(), consume) {
+            ((ctxt, mut split_token), true) => {
+                (ctxt.remove_file(fd, &mut split_token), split_token)
+            }
+            ((ctxt, mut split_token), false) => (ctxt.get_file(fd, &mut split_token), split_token),
+        };
+        let file = file.ok_or(Error::new(EBADF))?;
+
+        let desc = file.description.read(split_token.token());
+        if desc.scheme != scheme_id {
+            return Err(Error::new(EXDEV));
+        }
+        nums.push(desc.number);
+    }
+
+    let scheme = scheme::get_scheme(token.token(), scheme_id)?;
+
+    if flags.contains(CallFlags::STD_FS) {
+        scheme.translate_std_fs_call(
+            &nums,
+            target_file.description,
+            payload,
+            flags,
+            metadata,
+            token,
+        )
+    } else {
+        scheme.kcall(&nums, payload, flags, metadata, token)
+    }
+}
+
+fn call_fdwrite(
+    fd: FileHandle,
+    payload: UserSliceRw,
+    flags: CallFlags,
+    metadata: &[u64],
+    token: &mut CleanLockToken,
+) -> Result<usize> {
+    let payload_chunks = payload.in_exact_chunks(size_of::<usize>());
+    let fds = payload_chunks
+        .map(|chunk| {
+            let fd = chunk.read_usize()?;
+            Ok(FileHandle::from(fd))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let len = fds.len();
+
+    // TODO: Ensure deadlocks can't happen
+    let (scheme, number, descs_to_send) = {
+        let (scheme, number) = {
+            let current_lock = context::current();
+            let mut current = current_lock.read(token.token());
+            let (context, mut token) = current.token_split();
+            let file_descriptor = context.get_file(fd, &mut token).ok_or(Error::new(EBADF))?;
+            let desc = &file_descriptor.description.read(token.token());
+            (desc.scheme, desc.number)
+        };
+        let scheme = scheme::get_scheme(token.token(), scheme)?;
+
+        let current_lock = context::current();
+        let mut current = current_lock.read(token.token());
+        let (context, mut token) = current.token_split();
+        (
+            scheme,
+            number,
+            if flags.contains(CallFlags::FD_CLONE) {
+                context.bulk_get_files(&fds, &mut token)
+            } else {
+                context.bulk_remove_files(&fds, &mut token)
+            }?
+            .into_iter()
+            .map(|f| f.description)
+            .collect(),
+        )
+    };
+
+    //  Inform the scheme whether there are still references to the file description to be sent,
+    //  either in the current file table or in other file tables, regardless of whether EXCLUSIVE is
+    //  requested.
+    let flags_to_scheme = if flags.contains(CallFlags::FD_EXCLUSIVE) {
+        for desc in &descs_to_send {
+            if Arc::strong_count(desc) > 1 {
+                return Err(Error::new(EBUSY));
+            }
+        }
+
+        CallFlags::FD_EXCLUSIVE
+    } else {
+        CallFlags::empty()
+    };
+
+    scheme.kfdwrite(number, descs_to_send, flags_to_scheme, metadata, token)?;
+
+    Ok(len)
+}
+
+fn call_fdread(
+    fd: FileHandle,
+    payload: UserSliceRw,
+    flags: CallFlags,
+    metadata: &[u64],
+    token: &mut CleanLockToken,
+) -> Result<usize> {
+    let (scheme, number) = {
+        let (scheme, number) = {
+            let current_lock = context::current();
+            let mut current = current_lock.read(token.token());
+            let (context, mut token) = current.token_split();
+            let file_descriptor = context.get_file(fd, &mut token).ok_or(Error::new(EBADF))?;
+            let desc = file_descriptor.description.read(token.token());
+            (desc.scheme, desc.number)
+        };
+        let scheme = scheme::get_scheme(token.token(), scheme)?;
+
+        (scheme, number)
+    };
+
+    scheme.kfdread(number, payload, flags, metadata, token)
+}
+
+/// File descriptor controls
+pub fn fcntl(fd: FileHandle, cmd: usize, arg: usize, token: &mut CleanLockToken) -> Result<usize> {
+    let file = {
+        let current_lock = context::current();
+        let mut current = current_lock.read(token.token());
+        let (context, mut token) = current.token_split();
+        context.get_file(fd, &mut token)
+    }
+    .ok_or(Error::new(EBADF))?;
+
+    let (scheme_id, number, flags) = {
+        let desc = file.description.read(token.token());
+        (desc.scheme, desc.number, desc.flags)
+    };
+
+    if cmd == F_DUPFD {
+        // Not in match because 'files' cannot be locked
+        let new_file = duplicate_file(fd, UserSlice::empty(), token)?;
+
+        let current_lock = context::current();
+        let mut current = current_lock.read(token.token());
+        let (context, mut token) = current.token_split();
+        return context
+            .insert_file(FileHandle::from(arg), new_file, &mut token)
+            .ok_or(Error::new(EMFILE))
+            .map(FileHandle::into);
+    }
+
+    // Communicate fcntl with scheme
+    if cmd != F_GETFD && cmd != F_SETFD {
+        let scheme = scheme::get_scheme(token.token(), scheme_id)?;
+
+        scheme.fcntl(number, cmd, arg, token)?;
+    };
+
+    // Perform kernel operation if scheme agrees
+    {
+        let current_lock = context::current();
+        let mut current = current_lock.read(token.token());
+        let (context, mut token) = current.token_split();
+
+        let mut files = context.files.write(token.token());
+        let (files, mut token) = files.token_split();
+        match *files.get_mut(fd.get()).ok_or(Error::new(EBADF))? {
+            Some(ref mut file) => match cmd {
+                F_GETFD => Ok(0),
+                F_SETFD => Ok(0),
+                F_GETFL => Ok(flags as usize),
+                F_SETFL => {
+                    let new_flags = (flags & O_ACCMODE as u32) | (arg as u32 & !O_ACCMODE as u32);
+                    file.description.write(token.token()).flags = new_flags;
+                    Ok(0)
+                }
+                _ => Err(Error::new(EINVAL)),
+            },
+            None => Err(Error::new(EBADF)),
+        }
+    }
+}
+
+pub fn flink(fd: FileHandle, raw_path: UserSliceRo, token: &mut CleanLockToken) -> Result<()> {
+    let (caller_ctx, file) = {
+        let current_lock = context::current();
+        let mut current = current_lock.read(token.token());
+        let (context, mut token) = current.token_split();
+        (
+            context.caller_ctx(),
+            context.get_file(fd, &mut token).ok_or(Error::new(EBADF))?,
+        )
+    };
+
+    /*
+    let mut path_buf = BorrowedHtBuf::head()?;
+    let path = path_buf.use_for_string(raw_path)?;
+    */
+    let path_buf = copy_path_to_buf(raw_path, PATH_MAX)?;
+    let path = RedoxPath::from_absolute(&path_buf).ok_or(Error::new(EINVAL))?;
+    let (_, reference) = path.as_parts().ok_or(Error::new(EINVAL))?;
+
+    let (number, scheme_id) = {
+        let desc = file.description.read(token.token());
+        (desc.number, desc.scheme)
+    };
+
+    let scheme = scheme::get_scheme(token.token(), scheme_id)?;
+
+    // TODO: Check EXDEV.
+    /*
+    if scheme_id != description.scheme {
+        return Err(Error::new(EXDEV));
+    }
+    */
+
+    scheme.flink(number, reference.as_ref(), caller_ctx, token)
+}
+
+pub fn frename(fd: FileHandle, raw_path: UserSliceRo, token: &mut CleanLockToken) -> Result<()> {
+    let (caller_ctx, file) = {
+        let current_lock = context::current();
+        let mut current = current_lock.read(token.token());
+        let (context, mut token) = current.token_split();
+        (
+            context.caller_ctx(),
+            context.get_file(fd, &mut token).ok_or(Error::new(EBADF))?,
+        )
+    };
+
+    /*
+    let mut path_buf = BorrowedHtBuf::head()?;
+    let path = path_buf.use_for_string(raw_path)?;
+    */
+    let path_buf = copy_path_to_buf(raw_path, PATH_MAX)?;
+    let path = RedoxPath::from_absolute(&path_buf).ok_or(Error::new(EINVAL))?;
+    let (_, reference) = path.as_parts().ok_or(Error::new(EINVAL))?;
+
+    let (number, scheme_id) = {
+        let desc = file.description.read(token.token());
+        (desc.number, desc.scheme)
+    };
+
+    let scheme = scheme::get_scheme(token.token(), scheme_id)?;
+
+    // TODO: Check EXDEV.
+    /*
+    if scheme_id != description.scheme {
+        return Err(Error::new(EXDEV));
+    }
+    */
+
+    scheme.frename(number, reference.as_ref(), caller_ctx, token)
+}
+
+/// File status
+pub fn fstat(fd: FileHandle, user_buf: UserSliceWo, token: &mut CleanLockToken) -> Result<()> {
+    file_op_generic_ext(fd, token, |scheme, _, desc, token| {
+        scheme.kfstat(desc.number, user_buf, token)?;
+
+        // TODO: Ensure only the kernel can access the stat when st_dev is set, or use another API
+        // for retrieving the scheme ID from a file descriptor.
+        // TODO: Less hacky method.
+        let st_dev = desc
+            .scheme
+            .get()
+            .try_into()
+            .map_err(|_| Error::new(EOVERFLOW))?;
+        user_buf
+            .advance(core::mem::offset_of!(Stat, st_dev))
+            .and_then(|b| b.limit(8))
+            .ok_or(Error::new(EIO))?
+            .copy_from_slice(&u64::to_ne_bytes(st_dev))?;
+
+        Ok(())
+    })
+}
+
+pub fn funmap(virtual_address: usize, length: usize, token: &mut CleanLockToken) -> Result<usize> {
+    // Partial lengths in funmap are allowed according to POSIX, but not particularly meaningful;
+    // since the memory needs to SIGSEGV if later read, the entire page needs to disappear.
+    //
+    // Thus, while (temporarily) allowing unaligned lengths for compatibility, aligning the length
+    // should be done by libc.
+
+    let length_aligned = length.next_multiple_of(PAGE_SIZE);
+    if length != length_aligned {
+        warn!(
+            "funmap passed length {:#x} instead of {:#x}",
+            length, length_aligned
+        );
+    }
+
+    let addr_space = Arc::clone(context::current().read(token.token()).addr_space()?);
+    let span = PageSpan::validate_nonempty(VirtualAddress::new(virtual_address), length_aligned)
+        .ok_or(Error::new(EINVAL))?;
+    let unpin = false;
+    let notify = addr_space.munmap(span, unpin, token)?;
+    handle_notify_files(notify, token);
+
+    Ok(0)
+}
+
+pub fn mremap(
+    old_address: usize,
+    old_size: usize,
+    new_address: usize,
+    new_size: usize,
+    flags: usize,
+    token: &mut CleanLockToken,
+) -> Result<usize> {
+    if !old_address.is_multiple_of(PAGE_SIZE)
+        || !old_size.is_multiple_of(PAGE_SIZE)
+        || !new_address.is_multiple_of(PAGE_SIZE)
+        || !new_size.is_multiple_of(PAGE_SIZE)
+    {
+        return Err(Error::new(EINVAL));
+    }
+    if old_size == 0 || new_size == 0 {
+        return Err(Error::new(EINVAL));
+    }
+
+    let old_base = Page::containing_address(VirtualAddress::new(old_address));
+    let new_base = Page::containing_address(VirtualAddress::new(new_address));
+
+    let mremap_flags = MremapFlags::from_bits_truncate(flags);
+    let prot_flags = MapFlags::from_bits_truncate(flags)
+        & (MapFlags::PROT_READ | MapFlags::PROT_WRITE | MapFlags::PROT_EXEC);
+
+    let map_flags = if mremap_flags.contains(MremapFlags::FIXED_REPLACE) {
+        MapFlags::MAP_FIXED
+    } else if mremap_flags.contains(MremapFlags::FIXED) {
+        MapFlags::MAP_FIXED_NOREPLACE
+    } else {
+        MapFlags::empty()
+    } | prot_flags;
+
+    let addr_space = AddrSpace::current()?;
+    let src_span = PageSpan::new(old_base, old_size.div_ceil(PAGE_SIZE));
+    let new_page_count = new_size.div_ceil(PAGE_SIZE);
+    let fixed = map_flags.contains(MapFlags::MAP_FIXED)
+        || map_flags.contains(MapFlags::MAP_FIXED_NOREPLACE);
+    let requested_dst_base = (new_address != 0 || fixed).then_some(new_base);
+
+    if mremap_flags.contains(MremapFlags::KEEP_OLD) {
+        // TODO: This is a hack! Find a better interface for replacing this, perhaps a capability
+        // for non-CoW-borrowed i.e. owned frames, that can be inserted into address spaces.
+        if new_page_count != 1 {
+            return Err(Error::new(EOPNOTSUPP));
+        }
+
+        let raii_frame = addr_space.borrow_frame_enforce_rw_allocated(src_span.base, token)?;
+
+        let mut token = token.token();
+        let base = addr_space.acquire_write(token.downgrade()).mmap(
+            &addr_space,
+            requested_dst_base,
+            NonZeroUsize::new(1).expect("value specified is not zero"),
+            map_flags,
+            None,
+            |page, page_flags, mapper, flusher| {
+                let frame = raii_frame.take();
+                // XXX: add_ref(RefKind::Shared) is internally done by borrow_frame_enforce_rw_allocated(src_span.base).
+                // The page does not get unref-ed as we call take() on the `raii_frame`.
+                unsafe {
+                    mapper
+                        .map_phys(page.start_address(), frame.base(), page_flags)
+                        .ok_or(Error::new(ENOMEM))?
+                        .ignore();
+
+                    flusher.queue(frame, None, TlbShootdownActions::NEW_MAPPING);
+                }
+
+                Ok(Grant::allocated_one_page_nomap(page, page_flags))
+            },
+        )?;
+
+        Ok(base.start_address().data())
+    } else {
+        let base = addr_space.r#move(
+            None,
+            src_span,
+            requested_dst_base,
+            new_page_count,
+            map_flags,
+            None,
+            token.downgrade(),
+        )?;
+
+        Ok(base.start_address().data())
+    }
+}
+
+pub fn lseek(fd: FileHandle, pos: i64, whence: usize, token: &mut CleanLockToken) -> Result<usize> {
+    let (fsize, desc) = file_op_generic_ext(fd, token, |scheme, desc_arc, desc, token| {
+        Ok(if whence == SEEK_END {
+            (Some(scheme.fsize(desc.number, token)?), desc_arc)
+        } else {
+            (None, desc_arc)
+        })
+    })?;
+
+    let mut guard = desc.write(token.token());
+
+    let new_pos = match whence {
+        SEEK_SET => pos,
+        SEEK_CUR => pos
+            .checked_add_unsigned(guard.offset)
+            .ok_or(Error::new(EOVERFLOW))?,
+        SEEK_END => pos
+            .checked_add_unsigned(fsize.expect("fsize not None as whence is SEEK_END"))
+            .ok_or(Error::new(EOVERFLOW))?,
+        _ => return Err(Error::new(EINVAL)),
+    };
+    guard.offset = new_pos.try_into().map_err(|_| Error::new(EINVAL))?;
+
+    Ok(guard.offset as usize)
+}
+pub fn sys_read(fd: FileHandle, buf: UserSliceWo, token: &mut CleanLockToken) -> Result<usize> {
+    let (bytes_read, desc_arc, desc) =
+        file_op_generic_ext(fd, token, |scheme, desc_arc, desc, token| {
+            let offset = if desc.internal_flags.contains(InternalFlags::POSITIONED) {
+                desc.offset
+            } else {
+                u64::MAX
+            };
+            Ok((
+                scheme.kreadoff(desc.number, buf, offset, desc.flags, desc.flags, token)?,
+                desc_arc,
+                desc,
+            ))
+        })?;
+    if desc.internal_flags.contains(InternalFlags::POSITIONED) {
+        let offset = &mut desc_arc.write(token.token()).offset;
+        *offset = offset.saturating_add(bytes_read as u64)
+    }
+    Ok(bytes_read)
+}
+pub fn sys_write(fd: FileHandle, buf: UserSliceRo, token: &mut CleanLockToken) -> Result<usize> {
+    let (bytes_written, desc_arc, desc) =
+        file_op_generic_ext(fd, token, |scheme, desc_arc, desc, token| {
+            let offset = if desc.internal_flags.contains(InternalFlags::POSITIONED) {
+                desc.offset
+            } else {
+                u64::MAX
+            };
+            Ok((
+                scheme.kwriteoff(desc.number, buf, offset, desc.flags, desc.flags, token)?,
+                desc_arc,
+                desc,
+            ))
+        })?;
+    if desc.internal_flags.contains(InternalFlags::POSITIONED) {
+        let offset = &mut desc_arc.write(token.token()).offset;
+        *offset = offset.saturating_add(bytes_written as u64)
+    }
+    Ok(bytes_written)
+}

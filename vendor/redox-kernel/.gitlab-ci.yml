@@ -1,0 +1,81 @@
+workflow:
+  rules:
+    - if: '$CI_PROJECT_NAMESPACE == "redox-os"'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "master"'
+
+stages:
+  - build
+  - cross-build
+  - test
+  # TODO: benchmarks and profiling (maybe manually enabled for relevant MRs)?
+
+x86_64:
+  stage: build
+  script:
+    - redoxer env make
+  variables:
+    ARCH: "x86_64"
+
+aarch64:
+  stage: cross-build
+  image: "redoxos/redoxer:aarch64"
+  script:
+    - redoxer env make
+    # TODO: the image is outdated
+    - redoxer env cargo clippy --target ${ARCH}-unknown-redox
+  variables:
+    ARCH: "aarch64"
+
+i586:
+  stage: cross-build
+  script:
+    - TARGET=${ARCH}-unknown-redox redoxer env make
+    - TARGET=${ARCH}-unknown-redox redoxer clippy
+  variables:
+    ARCH: "i586"
+
+riscv64gc:
+  stage: cross-build
+  script:
+    - TARGET=${ARCH}-unknown-redox redoxer env make
+    - TARGET=${ARCH}-unknown-redox redoxer clippy
+  variables:
+    ARCH: "riscv64gc"
+
+fmt:
+  stage: build
+  script:
+      - redoxer env cargo fmt --check
+
+x86_64:boot:
+  stage: test
+  needs: [x86_64]
+  script:
+    - export COOKBOOK_SOURCE_IDENT=$CI_COMMIT_SHA
+    - redoxer env make test
+
+x86_64:relibc:
+  stage: test
+  needs: [x86_64]
+  # TODO: remove
+  allow_failure: true
+  script:
+    - export COOKBOOK_SOURCE_IDENT=$CI_COMMIT_SHA
+    - timeout -s KILL 9m redoxer env make test-relibc
+
+x86_64:clippy:
+  stage: build
+  needs: [x86_64]
+  script:
+  - redoxer clippy
+  variables:
+    ARCH: "x86_64"
+
+x86_64:profiling:
+  stage: build
+  needs: [x86_64]
+  script:
+  - make check
+  variables:
+    ARCH: "x86_64"
+    KERNEL_CHECK_FEATURES: profiling

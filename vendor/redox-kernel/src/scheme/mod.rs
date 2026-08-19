@@ -1,0 +1,790 @@
+//! # Schemes
+//! A scheme is a primitive for handling filesystem syscalls in Redox.
+//! Schemes accept paths from the kernel for `open`, and file descriptors that they generate
+//! are then passed for operations like `close`, `read`, `write`, etc.
+//!
+//! The kernel validates paths and file descriptors before they are passed to schemes,
+//! also stripping the scheme identifier of paths if necessary.
+
+use alloc::{
+    sync::{Arc, Weak},
+    vec::Vec,
+};
+use core::{
+    str,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+use hashbrown::hash_map::{self, DefaultHashBuilder, HashMap};
+use spin::Once;
+use syscall::{
+    data::{GlobalSchemes, NewFdParams, StdFsCallMeta},
+    error::*,
+    CallFlags, EventFlags, MunmapFlags, StdFsCallKind,
+};
+
+use crate::{
+    context::{
+        self,
+        file::{FileDescription, InternalFlags, LockedFileDescription},
+        memory::AddrSpaceWrapper,
+        ContextLock,
+    },
+    sync::{CleanLockToken, LockToken, RwLock, L0, L1},
+    syscall::usercopy::{UserSliceRo, UserSliceRw, UserSliceWo},
+};
+
+use self::{acpi::AcpiScheme, dtb::DtbScheme};
+
+use self::{
+    debug::DebugScheme,
+    event::EventScheme,
+    irq::IrqScheme,
+    memory::MemoryScheme,
+    pipe::PipeScheme,
+    proc::ProcScheme,
+    serio::SerioScheme,
+    sys::SysScheme,
+    time::TimeScheme,
+    user::{UserInner, UserScheme},
+};
+
+/// When compiled with the "acpi" feature - `acpi:` - allows drivers to read a limited set of ACPI tables.
+pub mod acpi;
+
+pub mod dtb;
+
+/// `debug:` - provides access to serial console
+pub mod debug;
+
+/// `event:` - allows reading of `Event`s which are registered using `fevent`
+pub mod event;
+
+/// `irq:` - allows userspace handling of IRQs
+pub mod irq;
+
+/// `memory:` - a scheme for accessing physical memory
+pub mod memory;
+
+/// `pipe:` - used internally by the kernel to implement `pipe`
+pub mod pipe;
+
+/// `proc:` - allows tracing processes and reading/writing their memory
+pub mod proc;
+
+/// `serio:` - provides access to ps/2 devices
+pub mod serio;
+
+/// `sys:` - system information, such as the context list and scheme list
+pub mod sys;
+
+/// `time:` - allows reading time, setting timeouts and getting events when they are met
+pub mod time;
+
+/// A wrapper around userspace schemes, tightly dependent on `root`
+pub mod user;
+
+/// Limit on number of schemes
+pub const SCHEME_MAX_SCHEMES: usize = 65_536;
+
+// Unique identifier for a scheme.
+int_like!(SchemeId, usize);
+
+// Unique identifier for a file descriptor.
+int_like!(FileHandle, AtomicFileHandle, usize, AtomicUsize);
+
+#[allow(dead_code)]
+pub enum StrOrBytes<'a> {
+    Str(&'a str),
+    Bytes(&'a [u8]),
+}
+
+#[allow(dead_code)]
+impl<'a> StrOrBytes<'a> {
+    pub fn as_str(&self) -> Result<&str, core::str::Utf8Error> {
+        match self {
+            StrOrBytes::Str(path) => Ok(path),
+            StrOrBytes::Bytes(slice) => core::str::from_utf8(slice),
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            StrOrBytes::Str(path) => path.as_bytes(),
+            StrOrBytes::Bytes(slice) => slice,
+        }
+    }
+
+    pub fn from_str(path: &'a str) -> Self {
+        StrOrBytes::Str(path)
+    }
+
+    pub fn from_bytes(slice: &'a [u8]) -> Self {
+        StrOrBytes::Bytes(slice)
+    }
+}
+
+struct HandleMap<T> {
+    handles: HashMap<usize, T>,
+    next_id: usize,
+}
+
+impl<T> HandleMap<T> {
+    const fn new() -> Self {
+        HandleMap {
+            handles: HashMap::with_hasher(DefaultHashBuilder::new()),
+            next_id: 1,
+        }
+    }
+
+    fn insert(&mut self, handle: T) -> usize {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.handles.insert(id, handle);
+        id
+    }
+
+    fn remove(&mut self, id: usize) -> Result<T> {
+        self.handles.remove(&id).ok_or(Error::new(EBADF))
+    }
+
+    fn get(&self, id: usize) -> Result<&T> {
+        self.handles.get(&id).ok_or(Error::new(EBADF))
+    }
+
+    fn get_mut(&mut self, id: usize) -> Result<&mut T> {
+        self.handles.get_mut(&id).ok_or(Error::new(EBADF))
+    }
+
+    fn iter(&self) -> hash_map::Iter<'_, usize, T> {
+        self.handles.iter()
+    }
+}
+
+enum Handle {
+    SchemeCreationCapability,
+    Scheme(KernelSchemes),
+}
+
+/// Schemes list
+static HANDLES: Once<RwLock<L1, HashMap<SchemeId, Handle>>> = Once::new();
+static SCHEME_LIST_NEXT_ID: AtomicUsize = AtomicUsize::new(MAX_GLOBAL_SCHEMES);
+static SCHEME_LIST_ID: AtomicUsize = AtomicUsize::new(0);
+
+/// Initialize schemes, called if needed
+fn init_schemes() -> RwLock<L1, HashMap<SchemeId, Handle>> {
+    let mut handles = HashMap::new();
+    let mut insert_globals = |globals: &[GlobalSchemes]| {
+        for &g in globals {
+            handles.insert(
+                SchemeId::from(g as usize),
+                Handle::Scheme(KernelSchemes::Global(g)),
+            );
+        }
+    };
+
+    // TODO: impl TryFrom<SchemeId> and bypass map for global schemes?
+    {
+        use GlobalSchemes::*;
+        insert_globals(&[Debug, Event, Memory, Pipe, Serio, Irq, Time, Sys, Proc]);
+
+        if cfg!(feature = "acpi") {
+            insert_globals(&[Acpi]);
+        }
+
+        if cfg!(dtb) {
+            insert_globals(&[Dtb]);
+        }
+    }
+    let next_id = SCHEME_LIST_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    handles.insert(SchemeId(next_id), Handle::Scheme(KernelSchemes::SchemeMgr));
+    SCHEME_LIST_ID.store(next_id, Ordering::Relaxed);
+
+    RwLock::new(handles)
+}
+
+/// Get a handle to a scheme.
+pub fn get_scheme(token: LockToken<'_, L0>, scheme_id: SchemeId) -> Result<KernelSchemes> {
+    match handles().read(token).get(&scheme_id) {
+        Some(Handle::Scheme(scheme)) => Ok(scheme.clone()),
+        _ => Err(Error::new(ENODEV)),
+    }
+}
+
+fn handles<'a>() -> &'a RwLock<L1, HashMap<SchemeId, Handle>> {
+    HANDLES.call_once(init_schemes)
+}
+
+/// Scheme list type
+pub struct SchemeList;
+
+impl SchemeList {
+    /// Get the id of the scheme list
+    pub fn id(&self) -> SchemeId {
+        SchemeId(SCHEME_LIST_ID.load(Ordering::Relaxed))
+    }
+
+    /// Get the UserInner
+    fn get_user_inner(&self, id: usize, token: &mut CleanLockToken) -> Option<Arc<UserInner>> {
+        match handles().read(token.token()).get(&SchemeId(id)) {
+            Some(Handle::Scheme(KernelSchemes::User(UserScheme { inner }))) => Some(inner.clone()),
+            _ => None,
+        }
+    }
+
+    /// Create a new scheme.
+    fn insert(&self, context: Weak<ContextLock>, token: &mut CleanLockToken) -> Result<SchemeId> {
+        let mut handles = handles().write(token.token());
+        let id = loop {
+            let mut id = SCHEME_LIST_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+
+            if id >= SCHEME_MAX_SCHEMES {
+                id = 1;
+                SCHEME_LIST_NEXT_ID.store(id, Ordering::Relaxed);
+            }
+
+            let id = SchemeId(id);
+
+            if !handles.contains_key(&id) {
+                break id;
+            }
+        };
+
+        let root_id = SchemeId(SCHEME_LIST_ID.load(Ordering::Relaxed));
+        let inner = Arc::new(UserInner::new(root_id, id, context));
+        let new_scheme = Handle::Scheme(KernelSchemes::User(UserScheme::new(inner)));
+        assert!(handles.insert(id, new_scheme).is_none());
+        Ok(id)
+    }
+
+    /// Remove a scheme
+    fn remove(&self, id: usize, token: &mut CleanLockToken) {
+        let scheme = handles().write(token.token()).remove(&SchemeId(id));
+
+        assert!(scheme.is_some());
+        if let Some(Handle::Scheme(KernelSchemes::User(user))) = scheme
+            && let Some(user) = Arc::into_inner(user.inner)
+        {
+            user.into_drop(token);
+        }
+    }
+}
+
+impl KernelScheme for SchemeList {
+    fn scheme_root(&self, token: &mut CleanLockToken) -> Result<usize> {
+        let id = SchemeId(0);
+        handles()
+            .write(token.token())
+            .insert(id, Handle::SchemeCreationCapability);
+        Ok(id.get())
+    }
+    fn kdup(
+        &self,
+        scheme_id: usize,
+        user_buf: UserSliceRo,
+        caller: CallerCtx,
+        token: &mut CleanLockToken,
+    ) -> Result<OpenResult> {
+        let scheme_id = SchemeId(scheme_id);
+        match handles()
+            .read(token.token())
+            .get(&scheme_id)
+            .ok_or(Error::new(EBADF))?
+        {
+            Handle::Scheme(KernelSchemes::User(UserScheme { inner })) => {
+                let inner = inner.clone();
+                assert!(scheme_id == inner.scheme_id);
+                let scheme = scheme_id;
+                let params = unsafe { user_buf.read_exact::<NewFdParams>()? };
+
+                return Ok(OpenResult::External(Arc::new(RwLock::new(
+                    FileDescription {
+                        scheme,
+                        number: params.number,
+                        offset: params.offset,
+                        flags: params.flags as u32,
+                        internal_flags: InternalFlags::from_extra0(params.internal_flags)
+                            .ok_or(Error::new(EINVAL))?,
+                    },
+                ))));
+            }
+            Handle::SchemeCreationCapability => (),
+            _ => return Err(Error::new(EBADF)),
+        };
+
+        const EXPECTED: &[u8] = b"create-scheme";
+        let mut buf = [0u8; EXPECTED.len()];
+
+        if user_buf.copy_common_bytes_to_slice(&mut buf)? < EXPECTED.len() || buf != *EXPECTED {
+            return Err(Error::new(EINVAL));
+        }
+
+        if caller.uid != 0 {
+            return Err(Error::new(EACCES));
+        };
+
+        let context = Arc::downgrade(&context::current());
+
+        let scheme_id = self.insert(context, token)?;
+        Ok(OpenResult::SchemeLocal(
+            scheme_id.get(),
+            InternalFlags::empty(),
+        ))
+    }
+
+    fn kfpath(&self, _id: usize, buf: UserSliceWo, _token: &mut CleanLockToken) -> Result<usize> {
+        buf.copy_common_bytes_from_slice("/scheme".as_bytes())
+    }
+
+    fn fevent(
+        &self,
+        id: usize,
+        flags: EventFlags,
+        token: &mut CleanLockToken,
+    ) -> Result<EventFlags> {
+        match self.get_user_inner(id, token) {
+            Some(inner) => inner.fevent(flags, token),
+            _ => Err(Error::new(EBADF)),
+        }
+    }
+
+    fn fsync(&self, id: usize, token: &mut CleanLockToken) -> Result<()> {
+        match self.get_user_inner(id, token) {
+            Some(inner) => inner.fsync(),
+            None => Err(Error::new(EBADF)),
+        }
+    }
+
+    fn close(&self, id: usize, token: &mut CleanLockToken) -> Result<()> {
+        self.remove(id, token);
+        Ok(())
+    }
+
+    fn kreadoff(
+        &self,
+        id: usize,
+        buf: UserSliceWo,
+        _offset: u64,
+        flags: u32,
+        _stored_flags: u32,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        match self.get_user_inner(id, token) {
+            Some(inner) => inner.read(buf, flags, token),
+            None => Err(Error::new(EBADF)),
+        }
+    }
+
+    fn kwrite(
+        &self,
+        id: usize,
+        buf: UserSliceRo,
+        _flags: u32,
+        _stored_flags: u32,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        match self.get_user_inner(id, token) {
+            Some(inner) => inner.write(buf, token),
+            None => Err(Error::new(EBADF)),
+        }
+    }
+
+    fn kfdwrite(
+        &self,
+        id: usize,
+        descs: Vec<Arc<LockedFileDescription>>,
+        flags: CallFlags,
+        metadata: &[u64],
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        match self.get_user_inner(id, token) {
+            Some(inner) => inner.call_fdwrite(descs, flags, metadata, token),
+            None => Err(Error::new(EBADF)),
+        }
+    }
+
+    fn kfdread(
+        &self,
+        id: usize,
+        payload: UserSliceRw,
+        flags: CallFlags,
+        metadata: &[u64],
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        match self.get_user_inner(id, token) {
+            Some(inner) => inner.call_fdread(payload, flags, metadata, token),
+            None => Err(Error::new(EBADF)),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum KernelSchemes {
+    SchemeMgr,
+    User(UserScheme),
+    Global(GlobalSchemes),
+}
+
+impl core::ops::Deref for KernelSchemes {
+    type Target = dyn KernelScheme;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::SchemeMgr => &SchemeList,
+            Self::User(scheme) => scheme,
+
+            Self::Global(global) => global.as_scheme(),
+        }
+    }
+}
+
+pub const ALL_KERNEL_SCHEMES: &[GlobalSchemes] = &[
+    GlobalSchemes::Debug,
+    GlobalSchemes::Event,
+    GlobalSchemes::Memory,
+    GlobalSchemes::Pipe,
+    GlobalSchemes::Serio,
+    GlobalSchemes::Irq,
+    GlobalSchemes::Time,
+    GlobalSchemes::Sys,
+    GlobalSchemes::Proc,
+    GlobalSchemes::Acpi,
+    GlobalSchemes::Dtb,
+];
+
+pub const MAX_GLOBAL_SCHEMES: usize = 16;
+pub const KERNEL_SCHEMES_COUNT: usize = ALL_KERNEL_SCHEMES.len();
+const _: () = {
+    assert!(1 + KERNEL_SCHEMES_COUNT < MAX_GLOBAL_SCHEMES);
+};
+
+pub trait SchemeExt {
+    fn as_scheme(&self) -> &dyn KernelScheme;
+    fn scheme_id(self) -> SchemeId;
+}
+impl SchemeExt for GlobalSchemes {
+    fn as_scheme(&self) -> &dyn KernelScheme {
+        match self {
+            Self::Debug => &DebugScheme,
+            Self::Event => &EventScheme,
+            Self::Memory => &MemoryScheme,
+            Self::Pipe => &PipeScheme,
+            Self::Serio => &SerioScheme,
+            Self::Irq => &IrqScheme,
+            Self::Time => &TimeScheme,
+            Self::Sys => &SysScheme,
+            Self::Proc => &ProcScheme,
+            Self::Acpi => &AcpiScheme,
+            Self::Dtb => &DtbScheme,
+        }
+    }
+    fn scheme_id(self) -> SchemeId {
+        SchemeId::new(self as usize)
+    }
+}
+
+#[cold]
+pub fn init_globals() {
+    if cfg!(feature = "acpi") {
+        AcpiScheme::init();
+    }
+    DtbScheme::init();
+    IrqScheme::init();
+}
+
+#[allow(unused_variables)]
+pub trait KernelScheme: Send + Sync + 'static {
+    fn scheme_root(&self, token: &mut CleanLockToken) -> Result<usize> {
+        Err(Error::new(EOPNOTSUPP))
+    }
+
+    fn kopenat(
+        &self,
+        file: usize,
+        path: StrOrBytes,
+        flags: usize,
+        fcntl_flags: u32,
+        _ctx: CallerCtx,
+        token: &mut CleanLockToken,
+    ) -> Result<OpenResult> {
+        Err(Error::new(EOPNOTSUPP))
+    }
+
+    fn kfmap(
+        &self,
+        number: usize,
+        addr_space: &Arc<AddrSpaceWrapper>,
+        map: &crate::syscall::data::Map,
+        consume: bool,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        Err(Error::new(EOPNOTSUPP))
+    }
+    fn kfunmap(
+        &self,
+        number: usize,
+        offset: usize,
+        size: usize,
+        flags: MunmapFlags,
+        token: &mut CleanLockToken,
+    ) -> Result<()> {
+        Err(Error::new(EOPNOTSUPP))
+    }
+
+    fn kdup(
+        &self,
+        old_id: usize,
+        buf: UserSliceRo,
+        _caller: CallerCtx,
+        token: &mut CleanLockToken,
+    ) -> Result<OpenResult> {
+        Err(Error::new(EOPNOTSUPP))
+    }
+    fn kwriteoff(
+        &self,
+        id: usize,
+        buf: UserSliceRo,
+        offset: u64,
+        flags: u32,
+        stored_flags: u32,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        if offset != u64::MAX {
+            return Err(Error::new(ESPIPE));
+        }
+        self.kwrite(id, buf, flags, stored_flags, token)
+    }
+    fn kreadoff(
+        &self,
+        id: usize,
+        buf: UserSliceWo,
+        offset: u64,
+        flags: u32,
+        stored_flags: u32,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        if offset != u64::MAX {
+            return Err(Error::new(ESPIPE));
+        }
+        self.kread(id, buf, flags, stored_flags, token)
+    }
+    fn kwrite(
+        &self,
+        id: usize,
+        buf: UserSliceRo,
+        flags: u32,
+        stored_flags: u32,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        Err(Error::new(EBADF))
+    }
+    fn kread(
+        &self,
+        id: usize,
+        buf: UserSliceWo,
+        flags: u32,
+        stored_flags: u32,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        Err(Error::new(EBADF))
+    }
+    fn kfpath(&self, id: usize, buf: UserSliceWo, token: &mut CleanLockToken) -> Result<usize> {
+        Err(Error::new(EOPNOTSUPP))
+    }
+    fn kfstat(&self, id: usize, buf: UserSliceWo, token: &mut CleanLockToken) -> Result<()> {
+        Err(Error::new(EBADF))
+    }
+    // SYS_FSTATVFS is removed, this still exists as the memory scheme implements it to allow df to show memory usage.
+    fn kfstatvfs(&self, id: usize, buf: UserSliceWo, token: &mut CleanLockToken) -> Result<()> {
+        Err(Error::new(EBADF))
+    }
+
+    // SYS_GETDENTS is removed, but this is still used by the irq, acpi and sys schemes. TODO:
+    // outsource sys scheme to userspace and switch to a non-filesystem API for acpi and irq?
+    fn getdents(
+        &self,
+        id: usize,
+        buf: UserSliceWo,
+        header_size: u16,
+        opaque_id_first: u64,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        Err(Error::new(EOPNOTSUPP))
+    }
+
+    // SYS_FSYNC is deprecated, but many schemes still implement the corresponding std_fs_call, so
+    // this should be kept for now.
+    fn fsync(&self, id: usize, token: &mut CleanLockToken) -> Result<()> {
+        Ok(())
+    }
+
+    fn fsize(&self, id: usize, token: &mut CleanLockToken) -> Result<u64> {
+        Err(Error::new(ESPIPE))
+    }
+    fn fchown(
+        &self,
+        id: usize,
+        new_uid: u32,
+        new_gid: u32,
+        token: &mut CleanLockToken,
+    ) -> Result<()> {
+        Err(Error::new(EBADF))
+    }
+    fn fevent(
+        &self,
+        id: usize,
+        flags: EventFlags,
+        token: &mut CleanLockToken,
+    ) -> Result<EventFlags> {
+        Ok(EventFlags::empty())
+    }
+    fn flink(
+        &self,
+        id: usize,
+        new_path: &str,
+        caller_ctx: CallerCtx,
+        token: &mut CleanLockToken,
+    ) -> Result<()> {
+        Err(Error::new(EBADF))
+    }
+    fn frename(
+        &self,
+        id: usize,
+        new_path: &str,
+        caller_ctx: CallerCtx,
+        token: &mut CleanLockToken,
+    ) -> Result<()> {
+        Err(Error::new(EBADF))
+    }
+    fn fcntl(
+        &self,
+        id: usize,
+        cmd: usize,
+        arg: usize,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+    fn unlinkat(
+        &self,
+        file: usize,
+        path: &str,
+        flags: usize,
+        ctx: CallerCtx,
+        token: &mut CleanLockToken,
+    ) -> Result<()> {
+        Err(Error::new(ENOENT))
+    }
+    fn close(&self, id: usize, token: &mut CleanLockToken) -> Result<()> {
+        Ok(())
+    }
+    fn detach(&self, id: usize, token: &mut CleanLockToken) -> Result<()> {
+        Ok(())
+    }
+    fn kcall(
+        &self,
+        fds: &[usize],
+        payload: UserSliceRw,
+        flags: CallFlags,
+        metadata: &[u64],
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        Err(Error::new(EOPNOTSUPP))
+    }
+    fn kstdfscall(
+        &self,
+        fds: &[usize],
+        kind: StdFsCallKind,
+        desc: Arc<LockedFileDescription>,
+        payload: UserSliceRw,
+        flags: CallFlags,
+        metadata: StdFsCallMeta,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        Err(Error::new(EOPNOTSUPP))
+    }
+    fn kfdwrite(
+        &self,
+        id: usize,
+        descs: Vec<Arc<LockedFileDescription>>,
+        flags: CallFlags,
+        metadata: &[u64],
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        Err(Error::new(EOPNOTSUPP))
+    }
+    fn kfdread(
+        &self,
+        id: usize,
+        payload: UserSliceRw,
+        flags: CallFlags,
+        metadata: &[u64],
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        Err(Error::new(EOPNOTSUPP))
+    }
+
+    fn translate_std_fs_call(
+        &self,
+        fds: &[usize],
+        desc: Arc<LockedFileDescription>,
+        payload: UserSliceRw,
+        flags: CallFlags,
+        metadata: &[u64],
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        let &[kind, arg1, arg2, ..] = metadata else {
+            return Err(Error::new(EINVAL));
+        };
+        let Some(kind) = StdFsCallKind::try_from_raw(kind as u8) else {
+            return Err(Error::new(EOPNOTSUPP));
+        };
+        let metadata = StdFsCallMeta::new(kind, arg1, arg2);
+        use StdFsCallKind::*;
+        match kind {
+            // Seems unlikely any kernel scheme will implement this. If so, it can be added back to
+            // this trait.
+            Relpathat => Err(Error::new(EOPNOTSUPP)),
+
+            _ => {
+                if fds.len() != 1 {
+                    return Err(Error::new(EINVAL));
+                }
+                let id = fds[0];
+                match kind {
+                    Getdents => self.getdents(
+                        id,
+                        payload.into_wo()?,
+                        metadata.arg2 as u16,
+                        metadata.arg1,
+                        token,
+                    ),
+                    Fstat => self.kfstat(id, payload.into_wo()?, token).map(|_| 0),
+                    Fstatvfs => self.kfstatvfs(id, payload.into_wo()?, token).map(|_| 0),
+                    Fsync => self.fsync(id, token).map(|_| 0),
+
+                    // The syscalls for these have been replaced by std_fs_call, and the only
+                    // scheme that used to provide a non-default impl was UserScheme. Preserve the
+                    // old default behavior for all other schemes.
+                    Ftruncate | Futimens | Fchmod => Err(Error::new(EBADF)),
+
+                    /* TODO: Support Fchown and Unlinkat using std_fs_call
+                    Fchown => self.kstdfscall(fds, kind, desc, payload, flags, metadata, token),
+                    Unlinkat => self.kstdfscall(fds, kind, payload, metadata, &caller).map(|_| 0)
+                    */
+                    _ => Err(Error::new(EOPNOTSUPP)),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum OpenResult {
+    SchemeLocal(usize, InternalFlags),
+    External(Arc<LockedFileDescription>),
+}
+pub struct CallerCtx {
+    pub pid: usize,
+    pub uid: u32,
+    pub gid: u32,
+}

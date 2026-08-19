@@ -1,0 +1,259 @@
+use syscall::data::GlobalSchemes;
+
+use crate::{
+    devices::graphical_debug,
+    event,
+    log::Writer,
+    scheme::*,
+    sync::{CleanLockToken, RwLock, WaitQueue, L1},
+    syscall::{
+        flag::{EventFlags, EVENT_READ, O_NONBLOCK},
+        usercopy::{UserSliceRo, UserSliceWo},
+    },
+};
+
+/// Input queue
+static INPUT: WaitQueue<u8> = WaitQueue::new();
+
+#[derive(Clone, Copy)]
+struct Handle {
+    num: usize,
+}
+
+static HANDLES: RwLock<L1, HandleMap<Handle>> = RwLock::new(HandleMap::new());
+
+/// Add to the input queue
+pub fn debug_input(data: u8, token: &mut CleanLockToken) {
+    INPUT.send(data, token);
+}
+
+// Notify readers of input updates
+pub fn debug_notify(token: &mut CleanLockToken) {
+    let ids: Vec<usize> = { HANDLES.read(token.token()).iter().map(|x| *x.0).collect() };
+    for id in ids {
+        event::trigger(GlobalSchemes::Debug.scheme_id(), id, EVENT_READ, token);
+    }
+}
+
+pub struct DebugScheme;
+
+#[expect(clippy::enum_clike_unportable_variant)]
+#[repr(usize)]
+enum SpecialFds {
+    Default = -1isize as usize,
+    NoPreserve = -2isize as usize,
+    DisableGraphicalDebug = -3isize as usize,
+
+    #[cfg(feature = "profiling")]
+    CtlProfiling = -4isize as usize,
+
+    SchemeRoot = -5isize as usize,
+    // NOTE: when adding new entries, ensure are checked correctly by the profiling code
+}
+
+impl KernelScheme for DebugScheme {
+    fn scheme_root(&self, token: &mut CleanLockToken) -> Result<usize> {
+        let id = HANDLES.write(token.token()).insert(Handle {
+            num: SpecialFds::SchemeRoot as usize,
+        });
+
+        Ok(id)
+    }
+    fn kopenat(
+        &self,
+        id: usize,
+        user_buf: StrOrBytes,
+        _flags: usize,
+        _fcntl_flags: u32,
+        ctx: CallerCtx,
+        token: &mut CleanLockToken,
+    ) -> Result<OpenResult> {
+        if HANDLES.read(token.token()).get(id)?.num != SpecialFds::SchemeRoot as usize {
+            return Err(Error::new(EACCES));
+        }
+
+        let path = user_buf.as_str().or(Err(Error::new(EINVAL)))?;
+        if ctx.uid != 0 {
+            return Err(Error::new(EPERM));
+        }
+
+        let num = match path {
+            "" => SpecialFds::Default as usize,
+
+            "no-preserve" => SpecialFds::NoPreserve as usize,
+
+            "disable-graphical-debug" => SpecialFds::DisableGraphicalDebug as usize,
+
+            #[cfg(feature = "profiling")]
+            p if p.starts_with("profiling-") => {
+                let num: u32 = path[10..].parse().map_err(|_| Error::new(ENOENT))?;
+                if !crate::profiling::cpu_exists(crate::cpu_set::LogicalCpuId::new(num)) {
+                    return Err(Error::new(ENOENT));
+                }
+                num as usize
+            }
+
+            #[cfg(feature = "profiling")]
+            "ctl-profiling" => SpecialFds::CtlProfiling as usize,
+
+            _ => return Err(Error::new(ENOENT)),
+        };
+
+        let id = HANDLES.write(token.token()).insert(Handle { num });
+
+        Ok(OpenResult::SchemeLocal(id, InternalFlags::empty()))
+    }
+
+    fn fevent(
+        &self,
+        id: usize,
+        _flags: EventFlags,
+        token: &mut CleanLockToken,
+    ) -> Result<EventFlags> {
+        let _handle = *HANDLES.read(token.token()).get(id)?;
+
+        Ok(EventFlags::empty())
+    }
+
+    fn fsync(&self, id: usize, token: &mut CleanLockToken) -> Result<()> {
+        let _handle = *HANDLES.read(token.token()).get(id)?;
+
+        Ok(())
+    }
+
+    fn close(&self, id: usize, token: &mut CleanLockToken) -> Result<()> {
+        HANDLES.write(token.token()).remove(id)?;
+
+        Ok(())
+    }
+    fn kread(
+        &self,
+        id: usize,
+        buf: UserSliceWo,
+        flags: u32,
+        _stored_flags: u32,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        let handle = *HANDLES.read(token.token()).get(id)?;
+
+        if handle.num == SpecialFds::DisableGraphicalDebug as usize
+            || handle.num == SpecialFds::SchemeRoot as usize
+        {
+            return Err(Error::new(EBADF));
+        }
+
+        #[cfg(feature = "profiling")]
+        if handle.num == SpecialFds::CtlProfiling as usize {
+            return Err(Error::new(EBADF));
+        }
+
+        // TODO: add "try_from_raw" or similar to prevent future bugs
+        #[cfg(feature = "profiling")]
+        if handle.num != SpecialFds::Default as usize
+            && handle.num != SpecialFds::NoPreserve as usize
+        {
+            return crate::profiling::drain_buffer(
+                crate::cpu_set::LogicalCpuId::new(handle.num as u32),
+                buf,
+            );
+        }
+
+        INPUT.receive_into_user(
+            buf,
+            flags & O_NONBLOCK as u32 == 0,
+            "DebugScheme::read",
+            token,
+        )
+    }
+
+    fn kwrite(
+        &self,
+        id: usize,
+        buf: UserSliceRo,
+        _flags: u32,
+        _stored_flags: u32,
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        let handle = *HANDLES.read(token.token()).get(id)?;
+
+        #[cfg(feature = "profiling")]
+        if handle.num == SpecialFds::CtlProfiling as usize {
+            let mut dst = [0];
+            buf.copy_to_slice(&mut dst)?;
+
+            let is_profiling = match dst[0] {
+                b'0' => false,
+                b'1' => true,
+                _ => return Err(Error::new(EINVAL)),
+            };
+            info!("Wrote {is_profiling} to IS_PROFILING");
+            crate::profiling::IS_PROFILING.store(is_profiling, Ordering::Relaxed);
+
+            return Ok(1);
+        }
+
+        if handle.num == SpecialFds::DisableGraphicalDebug as usize {
+            graphical_debug::fini();
+
+            return Ok(0);
+        }
+
+        if handle.num != SpecialFds::Default as usize
+            && handle.num != SpecialFds::NoPreserve as usize
+        {
+            return Err(Error::new(EINVAL));
+        }
+
+        let mut tmp = [0_u8; 512];
+
+        for chunk in buf.in_variable_chunks(tmp.len()) {
+            let byte_count = chunk.copy_common_bytes_to_slice(&mut tmp)?;
+            let tmp_bytes = &tmp[..byte_count];
+
+            // The reason why a new writer is created for each iteration, is because the page fault
+            // handler in usercopy might use the same lock when printing for debug purposes, and
+            // although it most likely won't, it would be dangerous to rely on that assumption.
+            Writer::new().write(tmp_bytes, handle.num != SpecialFds::NoPreserve as usize);
+        }
+
+        Ok(buf.len())
+    }
+    fn kfpath(&self, id: usize, buf: UserSliceWo, token: &mut CleanLockToken) -> Result<usize> {
+        let handle = *HANDLES.read(token.token()).get(id)?;
+        if handle.num != SpecialFds::Default as usize
+            && handle.num != SpecialFds::NoPreserve as usize
+        {
+            return Err(Error::new(EINVAL));
+        }
+
+        // TODO: Copy elsewhere in the kernel?
+        const SRC: &[u8] = b"debug:";
+        let byte_count = core::cmp::min(buf.len(), SRC.len());
+        buf.limit(byte_count)
+            .expect("must succeed")
+            .copy_from_slice(&SRC[..byte_count])?;
+
+        Ok(byte_count)
+    }
+    #[cfg(feature = "profiling")]
+    fn kcall(
+        &self,
+        fds: &[usize],
+        payload: UserSliceRw,
+        flags: CallFlags,
+        metadata: &[u64],
+        token: &mut CleanLockToken,
+    ) -> Result<usize> {
+        let &[fd] = <&[usize; 1]>::try_from(fds).map_err(|_| Error::new(EBADF))?;
+        // must be profiling pipe!
+        if HANDLES.read(token.token()).get(fd)?.num > u32::MAX as usize {
+            return Err(Error::new(EBADF));
+        }
+        let src = crate::profiling::lookup_dbg_id(
+            metadata.get(0).copied().unwrap_or(u64::MAX) as u32,
+            token,
+        )
+        .ok_or(Error::new(ENOENT))?;
+        payload.copy_common_bytes_from_slice(src.as_bytes())
+    }
+}

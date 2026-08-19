@@ -1,0 +1,16 @@
+[package]
+name = "rmm"
+version = "0.1.0"
+authors = ["Jeremy Soller <jeremy@system76.com>"]
+edition = "2024"
+
+[dependencies]
+bitflags = "2"
+
+[features]
+std = []
+
+[[bin]]
+name = "rmm"
+path = "src/main.rs"
+required-features = ["std"]
