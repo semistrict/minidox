@@ -16,6 +16,7 @@ minidox-redoxfs = { path = "../minidox-redoxfs" }
 seccompiler = "0.5.0"
 tempfile.workspace = true
 vmm-sys-util = "0.15.0"
+virtio-devices = { path = "../../vendor/cloud-hypervisor/virtio-devices", features = ["kvm"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 serde_json = "1.0.151"

@@ -3010,6 +3010,14 @@ impl Vm {
             .collect()
     }
 
+    pub fn start_initial_dirty_log(&mut self) -> result::Result<(), MigratableError> {
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .start_dirty_log_preserving_bitmap()?;
+        self.device_manager.lock().unwrap().start_dirty_log()
+    }
+
     /// Get the VM state.
     pub fn get_state(&self) -> VmState {
         self.state

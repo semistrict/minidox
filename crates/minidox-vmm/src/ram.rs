@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
 use std::ptr::NonNull;
 use std::slice;
 use std::sync::Arc;
@@ -72,6 +71,24 @@ pub struct KvmGuestRam {
     pages: Vec<Arc<RamPage>>,
     host_dirty: BTreeSet<usize>,
     private: bool,
+    sealed: bool,
+}
+
+pub(crate) struct RamForkPreparation {
+    generation: Arc<RamGeneration>,
+    pages: BTreeMap<usize, Arc<RamPage>>,
+    seals_existing_generation: bool,
+}
+
+pub(crate) struct RamForkBranch {
+    len: usize,
+    pages: Vec<Arc<RamPage>>,
+}
+
+impl RamForkBranch {
+    pub(crate) fn materialize(self) -> Result<KvmGuestRam, Error> {
+        KvmGuestRam::from_pages(self.len, self.pages)
+    }
 }
 
 impl KvmGuestRam {
@@ -85,15 +102,16 @@ impl KvmGuestRam {
             len,
             pages: Vec::with_capacity(len / RAM_PAGE_SIZE),
             host_dirty: BTreeSet::new(),
-            private: false,
+            private: true,
+            sealed: false,
         };
 
         let generation = RamGeneration::zeroed(len)?;
         for index in 0..len / RAM_PAGE_SIZE {
             let page = RamPage::new(Arc::clone(&generation), (index * RAM_PAGE_SIZE) as u64);
-            ram.map_page(index, &page, false)?;
             ram.pages.push(page);
         }
+        ram.map_all_pages(true)?;
         Ok(ram)
     }
 
@@ -222,29 +240,125 @@ impl KvmGuestRam {
         self.fork_pages(dirty)
     }
 
+    /// Copy the current dirty set while the VM keeps running. Writes racing
+    /// these copies remain tracked by KVM and are recopied at the pause barrier.
+    pub(crate) fn prepare_fork(&self, pages: &[usize]) -> Result<RamForkPreparation, Error> {
+        let pages = pages.iter().copied().collect::<BTreeSet<_>>();
+        for &page in &pages {
+            if page >= self.pages.len() {
+                return Err(Error::InvalidDirtyPage {
+                    page,
+                    pages: self.pages.len(),
+                });
+            }
+        }
+
+        if !self.sealed {
+            for &page in &pages {
+                let backing = &self.pages[page];
+                self.copy_page_to(page, &backing.generation.file, backing.offset)?;
+            }
+            return Ok(RamForkPreparation {
+                generation: Arc::clone(&self.pages[0].generation),
+                pages: BTreeMap::new(),
+                seals_existing_generation: true,
+            });
+        }
+
+        let generation = RamGeneration::zeroed(pages.len() * RAM_PAGE_SIZE)?;
+        let mut prepared = BTreeMap::new();
+        for (generation_index, page) in pages.into_iter().enumerate() {
+            let offset = (generation_index * RAM_PAGE_SIZE) as u64;
+            self.copy_page_to(page, &generation.file, offset)?;
+            prepared.insert(page, RamPage::new(Arc::clone(&generation), offset));
+        }
+        Ok(RamForkPreparation {
+            generation,
+            pages: prepared,
+            seals_existing_generation: false,
+        })
+    }
+
+    pub(crate) fn finish_prepared_branch(
+        &mut self,
+        preparation: RamForkPreparation,
+        pages_dirtied_during_copy: &[usize],
+    ) -> Result<RamForkBranch, Error> {
+        let mut dirty = self.host_dirty.clone();
+        for &page in pages_dirtied_during_copy {
+            if page >= self.pages.len() {
+                return Err(Error::InvalidDirtyPage {
+                    page,
+                    pages: self.pages.len(),
+                });
+            }
+            dirty.insert(page);
+        }
+        self.finish_prepared_pages(preparation, dirty)
+    }
+
     fn fork_pages(&mut self, dirty: BTreeSet<usize>) -> Result<Self, Error> {
+        let preparation = self.prepare_fork(&[])?;
+        self.finish_prepared_pages(preparation, dirty)?
+            .materialize()
+    }
+
+    fn finish_prepared_pages(
+        &mut self,
+        mut preparation: RamForkPreparation,
+        dirty: BTreeSet<usize>,
+    ) -> Result<RamForkBranch, Error> {
+        if preparation.seals_existing_generation {
+            for index in dirty {
+                let backing = &self.pages[index];
+                self.copy_page_to(index, &backing.generation.file, backing.offset)?;
+            }
+            self.discard_private_pages()?;
+            self.private = true;
+            self.sealed = true;
+            self.host_dirty.clear();
+            return Ok(RamForkBranch {
+                len: self.len,
+                pages: self.pages.clone(),
+            });
+        }
+
         if self.private {
-            let generation = RamGeneration::zeroed(dirty.len() * RAM_PAGE_SIZE)?;
-            for (generation_index, index) in dirty.into_iter().enumerate() {
-                let offset = (generation_index * RAM_PAGE_SIZE) as u64;
-                generation
-                    .file
-                    .write_all_at(self.page_bytes(index), offset)
-                    .map_err(|error| Error::backend("write RAM generation page", error))?;
-                let page = RamPage::new(Arc::clone(&generation), offset);
-                self.map_page(index, &page, true)?;
+            let mut next_offset = preparation.pages.len() * RAM_PAGE_SIZE;
+            for index in dirty {
+                let page = if let Some(page) = preparation.pages.get(&index) {
+                    Arc::clone(page)
+                } else {
+                    let offset = next_offset as u64;
+                    next_offset += RAM_PAGE_SIZE;
+                    preparation
+                        .generation
+                        .file
+                        .set_len(next_offset as u64)
+                        .map_err(|error| Error::backend("grow RAM generation", error))?;
+                    let page = RamPage::new(Arc::clone(&preparation.generation), offset);
+                    preparation.pages.insert(index, Arc::clone(&page));
+                    page
+                };
+                self.copy_page_to(index, &preparation.generation.file, page.offset)?;
+            }
+
+            let changed = preparation.pages.keys().copied().collect::<BTreeSet<_>>();
+            for (index, page) in preparation.pages {
                 self.pages[index] = page;
             }
+            self.map_selected_pages(&changed, true)?;
         } else {
-            for index in 0..self.pages.len() {
-                let page = self.pages[index].clone();
-                self.map_page(index, &page, true)?;
-            }
+            self.map_all_pages(true)?;
             self.private = true;
         }
+        self.sealed = true;
         self.host_dirty.clear();
 
-        Self::from_pages(self.len, self.pages.clone())
+        Ok(RamForkBranch {
+            len: self.len,
+            pages: self.pages.clone(),
+        })
     }
 
     pub fn page_accounting<'a>(branches: impl IntoIterator<Item = &'a Self>) -> RamAccounting {
@@ -278,46 +392,135 @@ impl KvmGuestRam {
             pages,
             host_dirty: BTreeSet::new(),
             private: true,
+            sealed: true,
         };
-        for index in 0..ram.pages.len() {
-            let page = ram.pages[index].clone();
-            ram.map_page(index, &page, true)?;
-        }
+        ram.map_all_pages(true)?;
         Ok(ram)
     }
 
-    fn map_page(&mut self, index: usize, page: &RamPage, private: bool) -> Result<(), Error> {
-        let address = self.base.as_ptr().wrapping_add(index * RAM_PAGE_SIZE);
+    fn map_all_pages(&mut self, private: bool) -> Result<(), Error> {
+        let mut start = 0;
+        while start < self.pages.len() {
+            let generation = Arc::clone(&self.pages[start].generation);
+            let generation_offset = self.pages[start].offset;
+            let mut end = start + 1;
+            while end < self.pages.len()
+                && self.pages[end].generation.id == generation.id
+                && self.pages[end].offset
+                    == generation_offset + ((end - start) * RAM_PAGE_SIZE) as u64
+            {
+                end += 1;
+            }
+            self.map_run(start, end - start, &generation, generation_offset, private)?;
+            start = end;
+        }
+        Ok(())
+    }
+
+    fn map_selected_pages(
+        &mut self,
+        selected: &BTreeSet<usize>,
+        private: bool,
+    ) -> Result<(), Error> {
+        let mut selected = selected.iter().copied().peekable();
+        while let Some(start) = selected.next() {
+            let generation = Arc::clone(&self.pages[start].generation);
+            let generation_offset = self.pages[start].offset;
+            let mut end = start + 1;
+            while selected.peek().copied() == Some(end)
+                && self.pages[end].generation.id == generation.id
+                && self.pages[end].offset
+                    == generation_offset + ((end - start) * RAM_PAGE_SIZE) as u64
+            {
+                selected.next();
+                end += 1;
+            }
+            self.map_run(start, end - start, &generation, generation_offset, private)?;
+        }
+        Ok(())
+    }
+
+    fn map_run(
+        &mut self,
+        start_page: usize,
+        page_count: usize,
+        generation: &RamGeneration,
+        generation_offset: u64,
+        private: bool,
+    ) -> Result<(), Error> {
+        let address = self.base.as_ptr().wrapping_add(start_page * RAM_PAGE_SIZE);
         let flags = libc::MAP_FIXED
             | if private {
                 libc::MAP_PRIVATE
             } else {
                 libc::MAP_SHARED
             };
-        // SAFETY: the destination is one page of the address range reserved by
-        // this object, the fd is a page-sized regular file, and MAP_FIXED keeps
+        // SAFETY: the destination is a page-aligned subrange of the reservation,
+        // the generation contains the complete file range, and MAP_FIXED keeps
         // the KVM-visible virtual address stable.
         let mapped = unsafe {
             libc::mmap(
                 address.cast(),
-                RAM_PAGE_SIZE,
+                page_count * RAM_PAGE_SIZE,
                 libc::PROT_READ | libc::PROT_WRITE,
                 flags,
-                page.generation.file.as_raw_fd(),
-                page.offset as libc::off_t,
+                generation.file.as_raw_fd(),
+                generation_offset as libc::off_t,
             )
         };
         if mapped == libc::MAP_FAILED {
-            return Err(Error::backend("map RAM page", io::Error::last_os_error()));
+            return Err(Error::backend("map RAM run", io::Error::last_os_error()));
         }
         Ok(())
     }
 
-    fn page_bytes(&self, index: usize) -> &[u8] {
-        // SAFETY: every page index comes from the page vector and is mapped.
-        unsafe {
-            slice::from_raw_parts(self.base.as_ptr().add(index * RAM_PAGE_SIZE), RAM_PAGE_SIZE)
+    fn discard_private_pages(&mut self) -> Result<(), Error> {
+        // SAFETY: the full range is a live MAP_PRIVATE file mapping owned by
+        // this RAM object. The VM is paused, and the backing file now contains
+        // the exact fork-point bytes, so discarding private CoW pages makes the
+        // source and child fault the same page-cache pages without moving the
+        // KVM-visible virtual address.
+        let result =
+            unsafe { libc::madvise(self.base.as_ptr().cast(), self.len, libc::MADV_DONTNEED) };
+        if result != 0 {
+            return Err(Error::backend(
+                "discard sealed private RAM pages",
+                io::Error::last_os_error(),
+            ));
         }
+        Ok(())
+    }
+
+    fn copy_page_to(&self, index: usize, file: &File, offset: u64) -> Result<(), Error> {
+        let source = self.base.as_ptr().wrapping_add(index * RAM_PAGE_SIZE);
+        let mut written = 0;
+        while written < RAM_PAGE_SIZE {
+            // SAFETY: the source points into the live RAM mapping. KVM may
+            // mutate it concurrently during preparation; a racing page is
+            // logged again and recopied after vCPUs stop.
+            let result = unsafe {
+                libc::pwrite(
+                    file.as_raw_fd(),
+                    source.add(written).cast(),
+                    RAM_PAGE_SIZE - written,
+                    (offset + written as u64) as libc::off_t,
+                )
+            };
+            if result < 0 {
+                return Err(Error::backend(
+                    "copy RAM generation page",
+                    io::Error::last_os_error(),
+                ));
+            }
+            if result == 0 {
+                return Err(Error::backend(
+                    "copy RAM generation page",
+                    io::Error::new(io::ErrorKind::WriteZero, "pwrite returned zero"),
+                ));
+            }
+            written += result as usize;
+        }
+        Ok(())
     }
 
     fn checked_range(&self, offset: usize, len: usize) -> Result<std::ops::Range<usize>, Error> {

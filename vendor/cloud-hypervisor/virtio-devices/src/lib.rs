@@ -23,6 +23,7 @@ pub mod balloon;
 pub mod block;
 mod console;
 pub mod epoll_helper;
+pub mod in_process_fs;
 mod iommu;
 pub mod mem;
 pub mod net;
@@ -46,10 +47,13 @@ pub use self::block::{Block, BlockState};
 pub use self::console::{Console, ConsoleResizer, Endpoint};
 pub use self::device::{
     ActivationContext, DmaRemapping, VirtioCommon, VirtioDevice, VirtioInterrupt,
-    VirtioInterruptType, VirtioSharedMemoryList,
+    VirtioInterruptType, VirtioSharedMemory, VirtioSharedMemoryList,
 };
 pub use self::epoll_helper::{
     EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError, EpollHelperHandler,
+};
+pub use self::in_process_fs::{
+    FsDirEntry, FsNodeAttr, InProcessFs, InProcessFsBackend, in_process_fs, register_in_process_fs,
 };
 pub use self::iommu::{AccessPlatformMapping, Iommu, IommuMapping};
 pub use self::mem::{BlocksState, Mem, VIRTIO_MEM_ALIGN_SIZE, VirtioMemMappingSource};

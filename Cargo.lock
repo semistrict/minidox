@@ -1017,6 +1017,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "virtio-devices",
  "vmm",
  "vmm-sys-util",
 ]

@@ -2539,6 +2539,13 @@ impl MemoryManager {
         MemorySlotAllocator::new(next_memory_slot, memory_slot_free_list)
     }
 
+    pub fn start_dirty_log_preserving_bitmap(&mut self) -> result::Result<(), MigratableError> {
+        self.vm
+            .start_dirty_log()
+            .context("Error starting VM dirty log")
+            .map_err(MigratableError::MigrateSend)
+    }
+
     pub fn allocate_memory_slot(&mut self) -> u32 {
         self.memory_slot_allocator().next_memory_slot()
     }

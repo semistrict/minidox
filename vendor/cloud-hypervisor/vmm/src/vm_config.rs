@@ -581,6 +581,12 @@ pub struct FsConfig {
     pub num_queues: usize,
     #[serde(default = "default_fsconfig_queue_size")]
     pub queue_size: u16,
+    /// In-memory registry handle used only by the embedded library API.
+    #[serde(skip)]
+    pub in_process_backend_id: Option<u64>,
+    /// Size of the embedded virtio-fs DAX window.
+    #[serde(skip)]
+    pub dax_window_size: u64,
 }
 
 pub fn default_fsconfig_num_queues() -> usize {

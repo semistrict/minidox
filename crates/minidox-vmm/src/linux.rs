@@ -4,8 +4,8 @@ use std::thread::JoinHandle;
 
 use cloud_hypervisor::api::{
     ApiAction, ApiRequest, VmBeginForkTracking, VmBoot, VmCaptureForkState, VmCreate,
-    VmForkStateCapture, VmPause, VmRestoreForkState, VmRestoreForkStateData, VmResume,
-    VmSetExternalMemory, VmmShutdown,
+    VmEnableInitialForkTracking, VmForkStateCapture, VmPause, VmRestoreForkState,
+    VmRestoreForkStateData, VmResume, VmSetExternalMemory, VmTakeDirtyRamPages, VmmShutdown,
 };
 use cloud_hypervisor::memory_manager::ExternalGuestMemory;
 pub use cloud_hypervisor::vm_config::VmConfig;
@@ -87,6 +87,11 @@ impl CloudHypervisorVm {
             },
             "install external guest RAM",
         )?;
+        self.send(
+            &VmEnableInitialForkTracking,
+            (),
+            "enable initial VM fork tracking",
+        )?;
         self.boot()
     }
 
@@ -103,6 +108,15 @@ impl CloudHypervisorVm {
     /// Capture paused vCPU/device state and dirty RAM ranges in memory.
     pub fn capture_fork_state(&self) -> Result<VmForkStateCapture, Error> {
         self.send(&VmCaptureForkState, (), "capture VM fork state")
+    }
+
+    /// Collect and reset the current dirty RAM set without pausing the VM.
+    pub fn take_dirty_ram_pages(&self) -> Result<Vec<usize>, Error> {
+        self.send(
+            &VmTakeDirtyRamPages,
+            (),
+            "collect running VM dirty RAM pages",
+        )
     }
 
     /// Recreate a paused child over a supervisor-owned CoW RAM branch.

@@ -1,16 +1,18 @@
 use std::collections::BTreeMap;
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use cloud_hypervisor::vm_config::{FsConfig, PciDeviceCommonConfig};
 use cloud_hypervisor_hypervisor::{Hypervisor, HypervisorVmConfig, Vm};
-use minidox_cache::{BranchingPageCache, CacheError, CachePageAccounting, NodeId};
-use minidox_redoxfs::RedoxBranch;
+use minidox_cache::{CacheError, CachePageAccounting, NodeId};
 
+use crate::virtiofs::VirtioFsBranch;
 use crate::{CloudHypervisorVm, KvmGuestRam, RamAccounting, VmConfig};
 
 const RAM_SLOT: u32 = 0;
 const RAM_GPA: u64 = 0;
-const DEFAULT_FILESYSTEM_SIZE: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct KvmVmId(u64);
@@ -18,7 +20,7 @@ pub struct KvmVmId(u64);
 struct SupervisedVm {
     backend: VmBackend,
     ram: KvmGuestRam,
-    filesystem: BranchingPageCache<RedoxBranch>,
+    filesystem: Arc<VirtioFsBranch>,
 }
 
 enum VmBackend {
@@ -65,6 +67,7 @@ pub struct KvmSupervisor {
     hypervisor: Arc<dyn Hypervisor>,
     next_vm: u64,
     vms: BTreeMap<KvmVmId, SupervisedVm>,
+    last_fork_pause: Option<Duration>,
 }
 
 impl KvmSupervisor {
@@ -74,6 +77,7 @@ impl KvmSupervisor {
                 .map_err(|error| SupervisorError::backend("create KVM hypervisor", error))?,
             next_vm: 1,
             vms: BTreeMap::new(),
+            last_fork_pause: None,
         })
     }
 
@@ -84,8 +88,8 @@ impl KvmSupervisor {
             .map_err(|error| SupervisorError::backend("create KVM VM", error))?;
         let ram = KvmGuestRam::new(ram_size)?;
         ram.register(vm.as_ref(), RAM_SLOT, RAM_GPA)?;
-        let filesystem = match RedoxBranch::create(DEFAULT_FILESYSTEM_SIZE) {
-            Ok(filesystem) => BranchingPageCache::new(filesystem),
+        let filesystem = match VirtioFsBranch::create() {
+            Ok(filesystem) => filesystem,
             Err(error) => {
                 let _ = ram.unregister(vm.as_ref(), RAM_SLOT, RAM_GPA);
                 return Err(error.into());
@@ -105,15 +109,23 @@ impl KvmSupervisor {
     }
 
     /// Boot a Cloud Hypervisor VM over supervisor-owned CoW RAM.
-    pub fn create_cloud_vm(&mut self, config: VmConfig) -> Result<KvmVmId, SupervisorError> {
+    pub fn create_cloud_vm(&mut self, mut config: VmConfig) -> Result<KvmVmId, SupervisorError> {
         let ram_size = usize::try_from(config.memory.size)
             .map_err(|_| crate::Error::InvalidRamSize(usize::MAX))?;
         let ram = KvmGuestRam::new(ram_size)?;
-        let filesystem = BranchingPageCache::new(RedoxBranch::create(DEFAULT_FILESYSTEM_SIZE)?);
+        let filesystem = VirtioFsBranch::create()?;
+        config.fs.get_or_insert_with(Vec::new).push(FsConfig {
+            pci_common: PciDeviceCommonConfig::default(),
+            tag: "minidox".to_owned(),
+            socket: PathBuf::new(),
+            num_queues: 1,
+            queue_size: 1024,
+            in_process_backend_id: Some(filesystem.backend_id()),
+            dax_window_size: filesystem.dax_window_size(),
+        });
         let backend = CloudHypervisorVm::start()?;
         backend.create(config)?;
         backend.boot_with_ram(&ram)?;
-        backend.begin_fork_tracking()?;
 
         let id = KvmVmId(self.next_vm);
         self.next_vm += 1;
@@ -138,7 +150,6 @@ impl KvmSupervisor {
         vm.backend.pause()?;
         let create_result: Result<NodeId, SupervisorError> = vm
             .filesystem
-            .store_mut()
             .create_file(name, size)
             .map_err(SupervisorError::from);
         let resume_result = vm.backend.resume();
@@ -163,6 +174,7 @@ impl KvmSupervisor {
             .create_vm(HypervisorVmConfig::default())
             .map_err(|error| SupervisorError::backend("create child KVM VM", error))?;
         let source_vm = self.vm_mut(source)?;
+        let pause_started = Instant::now();
         let VmBackend::Raw(source_backend) = &source_vm.backend else {
             unreachable!("backend kind was checked above")
         };
@@ -187,6 +199,7 @@ impl KvmSupervisor {
             let _ = child_ram.unregister(child_vm.as_ref(), RAM_SLOT, RAM_GPA);
             return Err(error);
         }
+        let pause_duration = pause_started.elapsed();
 
         let child = KvmVmId(self.next_vm);
         self.next_vm += 1;
@@ -198,6 +211,7 @@ impl KvmSupervisor {
                 filesystem: child_filesystem,
             },
         );
+        self.last_fork_pause = Some(pause_duration);
         Ok(child)
     }
 
@@ -206,25 +220,39 @@ impl KvmSupervisor {
         let VmBackend::Cloud(source_backend) = &source_vm.backend else {
             unreachable!("backend kind was checked by fork_vm")
         };
+        let dirty_before_copy = source_backend.take_dirty_ram_pages()?;
+        let preparation = source_vm.ram.prepare_fork(&dirty_before_copy)?;
+
+        let pause_started = Instant::now();
         source_backend.pause()?;
 
         let fork_result = (|| {
-            let capture = source_backend.capture_fork_state()?;
+            let mut capture = source_backend.capture_fork_state()?;
             let child_filesystem = source_vm.filesystem.fork()?;
-            let child_ram = source_vm.ram.fork_dirty_pages(&capture.dirty_ram_pages)?;
-            let child_backend = CloudHypervisorVm::start()?;
-            child_backend.restore_fork_state(capture, &child_ram)?;
-            child_backend.begin_fork_tracking()?;
-            child_backend.resume()?;
-            Ok::<_, SupervisorError>((child_backend, child_ram, child_filesystem))
+            if let Some(filesystems) = capture.config.fs.as_mut() {
+                for filesystem in filesystems {
+                    if filesystem.in_process_backend_id.is_some() {
+                        filesystem.in_process_backend_id = Some(child_filesystem.backend_id());
+                        filesystem.dax_window_size = child_filesystem.dax_window_size();
+                    }
+                }
+            }
+            let child_ram_branch = source_vm
+                .ram
+                .finish_prepared_branch(preparation, &capture.dirty_ram_pages)?;
+            Ok::<_, SupervisorError>((capture, child_ram_branch, child_filesystem))
         })();
 
         let resume_result = source_backend.resume().map_err(SupervisorError::from);
-        let (child_backend, child_ram, child_filesystem) = fork_result?;
-        if let Err(error) = resume_result {
-            drop(child_backend);
-            return Err(error);
-        }
+        let (capture, child_ram_branch, child_filesystem) = fork_result?;
+        resume_result?;
+        let pause_duration = pause_started.elapsed();
+
+        let child_ram = child_ram_branch.materialize()?;
+        let child_backend = CloudHypervisorVm::start()?;
+        child_backend.restore_fork_state(capture, &child_ram)?;
+        child_backend.begin_fork_tracking()?;
+        child_backend.resume()?;
 
         let child = KvmVmId(self.next_vm);
         self.next_vm += 1;
@@ -236,6 +264,7 @@ impl KvmSupervisor {
                 filesystem: child_filesystem,
             },
         );
+        self.last_fork_pause = Some(pause_duration);
         Ok(child)
     }
 
@@ -291,15 +320,10 @@ impl KvmSupervisor {
     ) -> Result<(), SupervisorError> {
         let vm = self.vm_mut(vm)?;
         vm.backend.pause()?;
-        let result: Result<(), SupervisorError> = (|| {
-            let cache = &mut vm.filesystem;
-            cache.open(node)?;
-            let write_result = cache.write(node, offset, bytes);
-            let close_result = cache.close(node);
-            write_result?;
-            close_result?;
-            Ok(())
-        })();
+        let result: Result<(), SupervisorError> = vm
+            .filesystem
+            .write(node, offset, bytes)
+            .map_err(SupervisorError::from);
         let resume_result = vm.backend.resume();
         result?;
         resume_result?;
@@ -315,30 +339,25 @@ impl KvmSupervisor {
     ) -> Result<Vec<u8>, SupervisorError> {
         let vm = self.vm_mut(vm)?;
         vm.backend.pause()?;
-        let mut bytes = vec![0; len];
-        let result: Result<usize, SupervisorError> = (|| {
-            let cache = &mut vm.filesystem;
-            cache.open(node)?;
-            let read_result = cache.read(node, offset, &mut bytes);
-            let close_result = cache.close(node);
-            let read = read_result?;
-            close_result?;
-            Ok(read)
-        })();
+        let result: Result<Vec<u8>, SupervisorError> = vm
+            .filesystem
+            .read(node, offset, len)
+            .map_err(SupervisorError::from);
         let resume_result = vm.backend.resume();
-        let read = result?;
+        let bytes = result?;
         resume_result?;
-        bytes.truncate(read);
         Ok(bytes)
     }
 
     pub fn page_accounting(&self) -> KvmForkAccounting {
         KvmForkAccounting {
             memory: KvmGuestRam::page_accounting(self.vms.values().map(|vm| &vm.ram)),
-            filesystem: BranchingPageCache::page_accounting(
-                self.vms.values().map(|vm| &vm.filesystem),
-            ),
+            filesystem: VirtioFsBranch::page_accounting(self.vms.values().map(|vm| &vm.filesystem)),
         }
+    }
+
+    pub fn last_fork_pause(&self) -> Option<Duration> {
+        self.last_fork_pause
     }
 
     fn vm(&self, id: KvmVmId) -> Result<&SupervisedVm, SupervisorError> {

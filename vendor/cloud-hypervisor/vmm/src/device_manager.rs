@@ -77,8 +77,8 @@ use hypervisor::arch::aarch64::regs::AARCH64_PMU_IRQ;
 #[cfg(feature = "kvm")]
 use iommufd_ioctls::IommuFd;
 use libc::{
-    MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, O_TMPFILE, PROT_READ, PROT_WRITE, TCSANOW, tcsetattr,
-    termios,
+    MAP_ANONYMOUS, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, O_TMPFILE, PROT_READ, PROT_WRITE,
+    TCSANOW, tcsetattr, termios,
 };
 use log::{debug, error, info, warn};
 use net_util::MacAddr;
@@ -100,7 +100,8 @@ use virtio_devices::transport::{VirtioPciDevice, VirtioPciDeviceActivator, Virti
 use virtio_devices::vhost_user::VhostUserConfig;
 use virtio_devices::{
     AccessPlatformMapping, Block, Endpoint, IommuMapping, VdpaDmaMapping, VirtioMemMappingSource,
-    balloon, mem, net, transport, vdpa, vhost_user, vsock,
+    VirtioSharedMemory, VirtioSharedMemoryList, balloon, in_process_fs, mem, net, transport, vdpa,
+    vhost_user, vsock,
 };
 use vm_allocator::{AddressAllocator, InterruptAllocError, SystemAllocator};
 use vm_device::dma_mapping::ExternalDmaMapping;
@@ -108,7 +109,6 @@ use vm_device::interrupt::{
     InterruptIndex, InterruptManager, LegacyIrqGroupConfig, MsiIrqGroupConfig,
 };
 use vm_device::{Bus, BusDevice, BusDeviceSync, Resource, UserspaceMapping};
-#[cfg(feature = "ivshmem")]
 use vm_memory::bitmap::AtomicBitmap;
 use vm_memory::guest_memory::FileOffset;
 use vm_memory::{
@@ -219,6 +219,18 @@ pub enum DeviceManagerError {
     /// Cannot create virtio-fs device
     #[error("Cannot create virtio-fs device")]
     CreateVirtioFs(#[source] vhost_user::Error),
+
+    /// Cannot create an embedded virtio-fs device.
+    #[error("Cannot create embedded virtio-fs device")]
+    CreateInProcessVirtioFs(#[source] io::Error),
+
+    /// Embedded virtio-fs backend handle is stale.
+    #[error("Embedded virtio-fs backend {0} is unavailable")]
+    MissingInProcessVirtioFs(u64),
+
+    /// Cannot reserve the DAX BAR address range.
+    #[error("Cannot allocate a {0}-byte virtio-fs DAX window")]
+    VirtioFsDaxAllocation(u64),
 
     /// Virtio-fs device was created without a socket.
     #[error("Virtio-fs device was created without a socket")]
@@ -3273,7 +3285,83 @@ impl DeviceManager {
 
         let mut node = device_node!(id);
 
-        if let Some(fs_socket) = fs_cfg.socket.to_str() {
+        if let Some(backend_id) = fs_cfg.in_process_backend_id {
+            let backend = in_process_fs(backend_id)
+                .ok_or(DeviceManagerError::MissingInProcessVirtioFs(backend_id))?;
+            let dax_window_size = if fs_cfg.dax_window_size == 0 {
+                2 << 20
+            } else {
+                fs_cfg.dax_window_size
+            };
+            if !dax_window_size.is_power_of_two() || dax_window_size < 2 << 20 {
+                return Err(DeviceManagerError::VirtioFsDaxAllocation(dax_window_size));
+            }
+            let dax_address = self.pci_segments[fs_cfg.pci_common.pci_segment as usize]
+                .mem64_allocator
+                .lock()
+                .unwrap()
+                .allocate(None, dax_window_size, Some(dax_window_size))
+                .ok_or(DeviceManagerError::VirtioFsDaxAllocation(dax_window_size))?;
+            let mapping = Arc::new(
+                MmapRegion::<AtomicBitmap>::build(
+                    None,
+                    dax_window_size as usize,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                )
+                .map_err(DeviceManagerError::NewMmapRegion)?,
+            );
+            // SAFETY: `mapping` owns this complete range until the virtio
+            // device is removed, and the DAX BAR address was just reserved.
+            let mem_slot = unsafe {
+                self.memory_manager
+                    .lock()
+                    .unwrap()
+                    .create_userspace_mapping(
+                        dax_address.raw_value(),
+                        dax_window_size as usize,
+                        mapping.as_ptr(),
+                        false,
+                        false,
+                        false,
+                    )
+            }
+            .map_err(DeviceManagerError::MemoryManager)?;
+            let shared_memory = VirtioSharedMemoryList {
+                mem_slot,
+                addr: dax_address,
+                mapping,
+                region_list: vec![VirtioSharedMemory {
+                    offset: 0,
+                    len: dax_window_size,
+                }],
+            };
+            let virtio_fs_device = Arc::new(Mutex::new(
+                virtio_devices::InProcessFs::new(
+                    id.clone(),
+                    &fs_cfg.tag,
+                    backend,
+                    shared_memory,
+                    self.seccomp_action.clone(),
+                    self.exit_evt
+                        .try_clone()
+                        .map_err(DeviceManagerError::EventFd)?,
+                    state_from_id(snapshot, id.as_str())
+                        .map_err(DeviceManagerError::RestoreGetState)?,
+                )
+                .map_err(DeviceManagerError::CreateInProcessVirtioFs)?,
+            ));
+
+            node.migratable = Some(Arc::clone(&virtio_fs_device) as Arc<Mutex<dyn Migratable>>);
+            self.device_tree.lock().unwrap().insert(id.clone(), node);
+
+            Ok(MetaVirtioDevice {
+                virtio_device: Arc::clone(&virtio_fs_device)
+                    as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
+                pci_common: fs_cfg.pci_common.clone(),
+                dma_handler: None,
+            })
+        } else if let Some(fs_socket) = fs_cfg.socket.to_str() {
             let virtio_fs_device = Arc::new(Mutex::new(
                 vhost_user::Fs::new(
                     id.clone(),

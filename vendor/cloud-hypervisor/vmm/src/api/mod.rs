@@ -863,6 +863,9 @@ pub enum ApiResponsePayload {
 
     /// Paused VM state and dirty memory ranges for an in-process fork.
     VmForkState(VmForkStateCapture),
+
+    /// Dirty RAM page indexes collected while the VM keeps running.
+    VmDirtyRamPages(Vec<usize>),
 }
 
 /// Machine state captured at the pause barrier for an in-process VM fork.
@@ -892,11 +895,15 @@ pub trait RequestHandler {
 
     fn vm_set_external_memory(&mut self, memory: ExternalGuestMemory) -> Result<(), VmError>;
 
+    fn vm_enable_initial_fork_tracking(&mut self) -> Result<(), VmError>;
+
     fn vm_pause(&mut self) -> Result<(), VmError>;
 
     fn vm_begin_fork_tracking(&mut self) -> Result<(), VmError>;
 
     fn vm_capture_fork_state(&mut self) -> Result<VmForkStateCapture, VmError>;
+
+    fn vm_take_dirty_ram_pages(&mut self) -> Result<Vec<usize>, VmError>;
 
     fn vm_restore_fork_state(&mut self, data: VmRestoreForkStateData) -> Result<(), VmError>;
 
@@ -1444,6 +1451,39 @@ impl ApiAction for VmSetExternalMemory {
     }
 }
 
+pub struct VmEnableInitialForkTracking;
+
+impl ApiAction for VmEnableInitialForkTracking {
+    type RequestBody = ();
+    type ResponseBody = ();
+
+    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmEnableInitialForkTracking");
+            let response = vmm
+                .vm_enable_initial_fork_tracking()
+                .map_err(ApiError::VmBeginForkTracking)
+                .map(|_| ApiResponsePayload::Empty);
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        match get_response(self, api_evt, api_sender, data)? {
+            ApiResponsePayload::Empty => Ok(()),
+            _ => Err(ApiError::ResponsePayloadType),
+        }
+    }
+}
+
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 pub struct VmCoredump;
 
@@ -1726,6 +1766,39 @@ impl ApiAction for VmCaptureForkState {
     ) -> ApiResult<Self::ResponseBody> {
         match get_response(self, api_evt, api_sender, data)? {
             ApiResponsePayload::VmForkState(capture) => Ok(capture),
+            _ => Err(ApiError::ResponsePayloadType),
+        }
+    }
+}
+
+pub struct VmTakeDirtyRamPages;
+
+impl ApiAction for VmTakeDirtyRamPages {
+    type RequestBody = ();
+    type ResponseBody = Vec<usize>;
+
+    fn request(&self, _: Self::RequestBody, response_sender: Sender<ApiResponse>) -> ApiRequest {
+        Box::new(move |vmm| {
+            info!("API request event: VmTakeDirtyRamPages");
+            let response = vmm
+                .vm_take_dirty_ram_pages()
+                .map_err(ApiError::VmCaptureForkState)
+                .map(ApiResponsePayload::VmDirtyRamPages);
+            response_sender
+                .send(response)
+                .map_err(VmmError::ApiResponseSend)?;
+            Ok(false)
+        })
+    }
+
+    fn send(
+        &self,
+        api_evt: EventFd,
+        api_sender: Sender<ApiRequest>,
+        data: Self::RequestBody,
+    ) -> ApiResult<Self::ResponseBody> {
+        match get_response(self, api_evt, api_sender, data)? {
+            ApiResponsePayload::VmDirtyRamPages(pages) => Ok(pages),
             _ => Err(ApiError::ResponsePayloadType),
         }
     }

@@ -703,6 +703,7 @@ pub struct Vmm {
     vm: VmOwnership,
     vm_config: Option<Arc<Mutex<VmConfig>>>,
     external_guest_memory: Option<ExternalGuestMemory>,
+    initial_fork_tracking: bool,
     seccomp_action: SeccompAction,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     activate_evt: EventFd,
@@ -933,6 +934,7 @@ impl Vmm {
             vm: VmOwnership::None,
             vm_config: None,
             external_guest_memory: None,
+            initial_fork_tracking: false,
             seccomp_action,
             hypervisor,
             activate_evt,
@@ -2431,9 +2433,11 @@ impl RequestHandler for Vmm {
                         .try_clone()
                         .map_err(VmError::EventFdClone)?;
 
-                    if let Some(ref vm_config) = self.vm_config {
+                    if let Some(vm_config) = self.vm_config.clone() {
+                        let external_guest_memory = self.external_guest_memory.take();
+                        let initial_fork_tracking = mem::take(&mut self.initial_fork_tracking);
                         let mut vm = Vm::new(
-                            Arc::clone(vm_config),
+                            vm_config,
                             exit_evt,
                             reset_evt,
                             guest_exit_evt,
@@ -2449,9 +2453,12 @@ impl RequestHandler for Vmm {
                             None,
                             None,
                             None,
-                            self.external_guest_memory.take(),
+                            external_guest_memory,
                         )?;
 
+                        if initial_fork_tracking {
+                            vm.start_initial_dirty_log().map_err(VmError::Snapshot)?;
+                        }
                         let r = vm.boot();
                         self.vm = VmOwnership::Owned(vm);
                         r
@@ -2478,6 +2485,17 @@ impl RequestHandler for Vmm {
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
             VmOwnership::None => {
                 self.external_guest_memory = Some(memory);
+                Ok(())
+            }
+        }
+    }
+
+    fn vm_enable_initial_fork_tracking(&mut self) -> result::Result<(), VmError> {
+        match self.vm {
+            VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
+            VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
+            VmOwnership::None => {
+                self.initial_fork_tracking = true;
                 Ok(())
             }
         }
@@ -2523,6 +2541,17 @@ impl RequestHandler for Vmm {
                     dirty_memory,
                     dirty_ram_pages,
                 })
+            }
+            VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
+            VmOwnership::None => Err(VmError::VmNotRunning),
+        }
+    }
+
+    fn vm_take_dirty_ram_pages(&mut self) -> result::Result<Vec<usize>, VmError> {
+        match self.vm {
+            VmOwnership::Owned(ref mut vm) => {
+                let dirty_memory = vm.dirty_log().map_err(VmError::Snapshot)?;
+                Ok(dirty_host_pages(&vm.guest_memory_regions(), &dirty_memory))
             }
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
             VmOwnership::None => Err(VmError::VmNotRunning),

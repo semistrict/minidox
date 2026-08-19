@@ -2172,6 +2172,8 @@ impl FsConfig {
             socket,
             num_queues,
             queue_size,
+            in_process_backend_id: None,
+            dax_window_size: 0,
         })
     }
 
@@ -3374,7 +3376,11 @@ impl VmConfig {
         }
 
         if let Some(fses) = &self.fs {
-            if !fses.is_empty() && !self.backed_by_shared_memory() {
+            if fses
+                .iter()
+                .any(|filesystem| filesystem.in_process_backend_id.is_none())
+                && !self.backed_by_shared_memory()
+            {
                 return Err(ValidationError::VhostUserRequiresSharedMemory);
             }
             for fs in fses {
@@ -4712,6 +4718,8 @@ mod unit_tests {
             tag: "mytag".to_owned(),
             num_queues: 1,
             queue_size: 1024,
+            in_process_backend_id: None,
+            dax_window_size: 0,
         }
     }
 

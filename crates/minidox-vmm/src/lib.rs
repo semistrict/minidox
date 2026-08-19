@@ -10,6 +10,8 @@ mod linux;
 mod ram;
 #[cfg(target_os = "linux")]
 mod supervisor;
+#[cfg(target_os = "linux")]
+mod virtiofs;
 
 #[cfg(target_os = "linux")]
 pub use cloud_hypervisor::api::VmForkStateCapture;

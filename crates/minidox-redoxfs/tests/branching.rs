@@ -55,3 +55,19 @@ fn redoxfs_child_survives_after_source_is_dropped() {
 
     assert_eq!(grandchild.read(node, 64, 14).unwrap(), b"inherited file");
 }
+
+#[test]
+fn branch_exposes_root_directory_metadata_for_virtiofs() {
+    let mut branch = RedoxBranch::create(16 * 1024 * 1024).unwrap();
+    let node = branch.create_file("guest-visible", 4096).unwrap();
+
+    assert_eq!(branch.lookup(1, "guest-visible").unwrap(), node);
+    assert_eq!(branch.metadata(node).unwrap().size, 4096);
+    assert!(
+        branch
+            .entries(1)
+            .unwrap()
+            .iter()
+            .any(|entry| entry.id == node && entry.name == "guest-visible")
+    );
+}

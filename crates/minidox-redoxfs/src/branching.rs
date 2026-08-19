@@ -149,6 +149,26 @@ pub struct BlockAccounting {
     pub shared_blocks: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeMetadata {
+    pub id: NodeId,
+    pub size: u64,
+    pub blocks_512: u64,
+    pub mode: u32,
+    pub links: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub atime: (u64, u32),
+    pub mtime: (u64, u32),
+    pub ctime: (u64, u32),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryEntry {
+    pub id: NodeId,
+    pub name: String,
+}
+
 /// An independently writable RedoxFS branch over shared immutable disk blocks.
 pub struct RedoxBranch {
     fs: FileSystem<CowDisk>,
@@ -184,6 +204,54 @@ impl RedoxBranch {
     pub fn write(&mut self, node: NodeId, offset: u64, bytes: &[u8]) -> io::Result<usize> {
         self.fs
             .tx(|tx| tx.write_node(TreePtr::<Node>::new(node), offset, bytes, 1, 0))
+            .map_err(io_error)
+    }
+
+    pub fn metadata(&mut self, node: NodeId) -> io::Result<NodeMetadata> {
+        self.fs
+            .tx(|tx| {
+                let node = tx.read_tree(TreePtr::<Node>::new(node))?;
+                let data = node.data();
+                Ok(NodeMetadata {
+                    id: node.id(),
+                    size: data.size(),
+                    blocks_512: data.blocks() * (BLOCK_SIZE / 512),
+                    mode: data.mode().into(),
+                    links: data.links(),
+                    uid: data.uid(),
+                    gid: data.gid(),
+                    atime: data.atime(),
+                    mtime: data.mtime(),
+                    ctime: data.ctime(),
+                })
+            })
+            .map_err(io_error)
+    }
+
+    pub fn lookup(&mut self, parent: NodeId, name: &str) -> io::Result<NodeId> {
+        self.fs
+            .tx(|tx| {
+                tx.find_node(TreePtr::<Node>::new(parent), name)
+                    .map(|node| node.ptr().id())
+            })
+            .map_err(io_error)
+    }
+
+    pub fn entries(&mut self, parent: NodeId) -> io::Result<Vec<DirectoryEntry>> {
+        self.fs
+            .tx(|tx| {
+                let mut entries = Vec::new();
+                tx.child_nodes(TreePtr::<Node>::new(parent), &mut entries)?;
+                entries
+                    .into_iter()
+                    .map(|entry| {
+                        Ok(DirectoryEntry {
+                            id: entry.node_ptr().id(),
+                            name: entry.name().ok_or_else(|| Error::new(EIO))?.to_owned(),
+                        })
+                    })
+                    .collect()
+            })
             .map_err(io_error)
     }
 
