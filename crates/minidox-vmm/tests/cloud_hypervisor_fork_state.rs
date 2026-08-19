@@ -33,7 +33,7 @@ fn supervisor_forks_running_vm_ram_redoxfs_and_machine_state() {
         "payload": {
             "kernel": kernel,
             "initramfs": initramfs,
-            "cmdline": "console=ttyAMA0 earlycon=pl011,0x09000000 panic=-1"
+            "cmdline": guest_kernel_cmdline()
         },
         "memory": { "size": RAM_SIZE },
         "console": { "mode": "Null" },
@@ -204,5 +204,16 @@ const fn guest_ram_start() -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
         0
+    }
+}
+
+const fn guest_kernel_cmdline() -> &'static str {
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    {
+        "console=ttyAMA0 earlycon=pl011,0x09000000 panic=-1"
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        "console=ttyS0 earlyprintk=ttyS0 panic=-1"
     }
 }

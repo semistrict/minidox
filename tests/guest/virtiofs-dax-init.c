@@ -15,6 +15,42 @@
 static const char expected[] = "before fork";
 static const char cold_fault_command[] = "cold fault";
 
+static int load_module(const char *path, int optional) {
+    int module = open(path, O_RDONLY | O_CLOEXEC);
+    if (module < 0) {
+        return optional && errno == ENOENT ? 0 : -1;
+    }
+    int result = syscall(SYS_finit_module, module, "", 0);
+    int saved_errno = errno;
+    close(module);
+    errno = saved_errno;
+    return result == 0 || errno == EEXIST ? 0 : -1;
+}
+
+static int load_modules(void) {
+    FILE *modules = fopen("/modules", "r");
+    if (modules == NULL) {
+        return load_module("/fuse.ko", 1) == 0 &&
+               load_module("/virtiofs.ko", 0) == 0 ? 0 : -1;
+    }
+
+    char path[128];
+    while (fgets(path, sizeof(path), modules) != NULL) {
+        path[strcspn(path, "\r\n")] = '\0';
+        if (path[0] != '\0' && load_module(path, 0) != 0) {
+            int saved_errno = errno;
+            fclose(modules);
+            errno = saved_errno;
+            dprintf(STDOUT_FILENO,
+                    "MINIDOX_VIRTIOFS_MODULE_ERROR path=%s errno=%d\n",
+                    path, errno);
+            return -1;
+        }
+    }
+    fclose(modules);
+    return 0;
+}
+
 int main(void) {
     long page_size = sysconf(_SC_PAGESIZE);
     void *ram_page = mmap(NULL, (size_t)page_size, PROT_READ | PROT_WRITE,
@@ -46,13 +82,10 @@ int main(void) {
     dprintf(STDOUT_FILENO, "MINIDOX_RAM_GPA=%#llx\n",
             (unsigned long long)ram_gpa);
 
-    int module = open("/virtiofs.ko", O_RDONLY | O_CLOEXEC);
-    if (module < 0 ||
-        (syscall(SYS_finit_module, module, "", 0) != 0 && errno != EEXIST)) {
+    if (load_modules() != 0) {
         dprintf(STDOUT_FILENO, "MINIDOX_VIRTIOFS_MODULE_ERROR errno=%d\n", errno);
         for (;;) pause();
     }
-    close(module);
 
     mkdir("/mnt", 0755);
     if (mount("minidox", "/mnt", "virtiofs", 0, "dax=always") != 0) {

@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use minidox_cache::{
-    CacheBranchId, CachePageAccounting, DaxPageMapping, MapFlags, NodeId, NodeStore, PAGE_SIZE,
-    SharedPageCache,
+    CacheBranchId, CacheError, CachePageAccounting, DaxPageMapping, MapFlags, NodeId, NodeStore,
+    PAGE_SIZE, SharedPageCache,
 };
 use minidox_redoxfs::{NodeMetadata, RedoxBranch};
 use virtio_devices::{FsDirEntry, FsNodeAttr, InProcessFsBackend, register_in_process_fs};
@@ -201,12 +201,12 @@ impl InProcessFsBackend for VirtioFsBranch {
         let inode = state
             .cache
             .with_store_mut(state.branch, |store| store.lookup(node_id(parent)?, name))
-            .map_err(io::Error::other)?;
+            .map_err(cache_io_error)?;
         state
             .cache
             .with_store_mut(state.branch, |store| store.metadata(inode))
             .map(node_attr)
-            .map_err(io::Error::other)
+            .map_err(cache_io_error)
     }
 
     fn getattr(&self, inode: u64) -> io::Result<FsNodeAttr> {
@@ -215,7 +215,7 @@ impl InProcessFsBackend for VirtioFsBranch {
             .cache
             .with_store_mut(state.branch, |store| store.metadata(node_id(inode)?))
             .map(node_attr)
-            .map_err(io::Error::other)
+            .map_err(cache_io_error)
     }
 
     fn open(&self, inode: u64) -> io::Result<()> {
@@ -223,7 +223,7 @@ impl InProcessFsBackend for VirtioFsBranch {
         state
             .cache
             .open(state.branch, node_id(inode)?)
-            .map_err(io::Error::other)
+            .map_err(cache_io_error)
     }
 
     fn close(&self, inode: u64) -> io::Result<()> {
@@ -231,7 +231,7 @@ impl InProcessFsBackend for VirtioFsBranch {
         state
             .cache
             .close(state.branch, node_id(inode)?)
-            .map_err(io::Error::other)
+            .map_err(cache_io_error)
     }
 
     fn read(&self, inode: u64, offset: u64, data: &mut [u8]) -> io::Result<usize> {
@@ -239,7 +239,7 @@ impl InProcessFsBackend for VirtioFsBranch {
         state
             .cache
             .read(state.branch, node_id(inode)?, offset, data)
-            .map_err(io::Error::other)
+            .map_err(cache_io_error)
     }
 
     fn write(&self, inode: u64, offset: u64, data: &[u8]) -> io::Result<usize> {
@@ -247,7 +247,7 @@ impl InProcessFsBackend for VirtioFsBranch {
         state
             .cache
             .write(state.branch, node_id(inode)?, offset, data)
-            .map_err(io::Error::other)
+            .map_err(cache_io_error)
     }
 
     fn sync(&self, inode: u64) -> io::Result<()> {
@@ -255,7 +255,7 @@ impl InProcessFsBackend for VirtioFsBranch {
         state
             .cache
             .sync(state.branch, node_id(inode)?)
-            .map_err(io::Error::other)
+            .map_err(cache_io_error)
     }
 
     fn entries(&self, inode: u64) -> io::Result<Vec<FsDirEntry>> {
@@ -263,14 +263,14 @@ impl InProcessFsBackend for VirtioFsBranch {
         let entries = state
             .cache
             .with_store_mut(state.branch, |store| store.entries(node_id(inode)?))
-            .map_err(io::Error::other)?;
+            .map_err(cache_io_error)?;
         entries
             .into_iter()
             .map(|entry| {
                 let metadata = state
                     .cache
                     .with_store_mut(state.branch, |store| store.metadata(entry.id))
-                    .map_err(io::Error::other)?;
+                    .map_err(cache_io_error)?;
                 Ok(FsDirEntry {
                     inode: entry.id.into(),
                     name: entry.name,
@@ -380,6 +380,13 @@ fn node_id(inode: u64) -> io::Result<NodeId> {
         .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))
 }
 
+fn cache_io_error(error: CacheError) -> io::Error {
+    match error {
+        CacheError::Io(error) => error,
+        error => io::Error::other(error),
+    }
+}
+
 fn node_attr(metadata: NodeMetadata) -> FsNodeAttr {
     FsNodeAttr {
         inode: metadata.id.into(),
@@ -432,7 +439,7 @@ fn activate_offsets(state: &mut State, offsets: &[u64]) -> io::Result<()> {
                 >= state
                     .cache
                     .with_store_mut(state.branch, |store| store.len(spec.inode))
-                    .map_err(io::Error::other)?
+                    .map_err(cache_io_error)?
             {
                 return Ok(false);
             }
@@ -444,7 +451,7 @@ fn activate_offsets(state: &mut State, offsets: &[u64]) -> io::Result<()> {
             let mapping = state
                 .cache
                 .map_page(state.branch, spec.inode, spec.file_offset, flags)
-                .map_err(io::Error::other)?;
+                .map_err(cache_io_error)?;
             // KVM registered the DAX window as one writable memslot and may pin
             // every page with write-capable GUP even for guest reads. Keep the
             // HVA writable; the guest PTE still enforces the requested access.
@@ -466,7 +473,7 @@ fn activate_offsets(state: &mut State, offsets: &[u64]) -> io::Result<()> {
                 state
                     .cache
                     .unmap(state.branch, mapping)
-                    .map_err(io::Error::other)?;
+                    .map_err(cache_io_error)?;
                 return Err(error);
             }
             state.active.insert(offset, mapping);
@@ -510,7 +517,7 @@ fn remove_offset(state: &mut State, offset: u64, remove_spec: bool) -> io::Resul
         state
             .cache
             .unmap(state.branch, mapping)
-            .map_err(io::Error::other)?;
+            .map_err(cache_io_error)?;
     } else if !state.specs.contains_key(&offset) {
         return Err(io::Error::from_raw_os_error(libc::ENOENT));
     }
@@ -518,4 +525,16 @@ fn remove_offset(state: &mut State, offset: u64, remove_spec: bool) -> io::Resul
         state.specs.remove(&offset);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_guest_lookup_preserves_enoent() {
+        let branch = VirtioFsBranch::create().unwrap();
+        let error = branch.lookup(1, "missing").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+    }
 }
