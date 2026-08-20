@@ -1,6 +1,7 @@
 // Copyright © 2019 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
+// Modified from upstream Cloud Hypervisor by the minidox project.
 //
 
 use std::collections::{HashMap, HashSet};

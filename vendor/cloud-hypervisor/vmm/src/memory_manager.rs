@@ -1,6 +1,7 @@
 // Copyright © 2019 Intel Corporation
 //
 // SPDX-License-Identifier: Apache-2.0
+// Modified from upstream Cloud Hypervisor by the minidox project.
 //
 
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]

@@ -1,0 +1,139 @@
+[graph]
+targets = [
+  "aarch64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-gnu",
+]
+
+[licenses]
+confidence-threshold = 0.93
+include-dev = true
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+exceptions = [
+  { crate = "epoll", allow = ["MPL-2.0"] },
+  { crate = "fdt", allow = ["MPL-2.0"] },
+]
+
+# Cloud Hypervisor publishes per-file SPDX identifiers, while most of its
+# internal path crates omit package-level license fields. These clarifications
+# bind those packages to the unmodified upstream license texts in LICENSES/.
+[[licenses.clarify]]
+crate = "arch"
+expression = "Apache-2.0 AND BSD-3-Clause"
+license-files = [
+  { path = "../LICENSES/Apache-2.0.txt", hash = 0 },
+  { path = "../LICENSES/BSD-3-Clause.txt", hash = 0 },
+]
+
+[[licenses.clarify]]
+crate = "block"
+expression = "Apache-2.0 AND BSD-3-Clause"
+license-files = [
+  { path = "../LICENSES/Apache-2.0.txt", hash = 0 },
+  { path = "../LICENSES/BSD-3-Clause.txt", hash = 0 },
+]
+
+[[licenses.clarify]]
+crate = "devices"
+expression = "Apache-2.0 AND BSD-3-Clause"
+license-files = [
+  { path = "../LICENSES/Apache-2.0.txt", hash = 0 },
+  { path = "../LICENSES/BSD-3-Clause.txt", hash = 0 },
+]
+
+[[licenses.clarify]]
+crate = "event_monitor"
+expression = "Apache-2.0"
+license-files = [{ path = "../LICENSES/Apache-2.0.txt", hash = 0 }]
+
+[[licenses.clarify]]
+crate = "net_util"
+expression = "Apache-2.0 AND BSD-3-Clause"
+license-files = [
+  { path = "../LICENSES/Apache-2.0.txt", hash = 0 },
+  { path = "../LICENSES/BSD-3-Clause.txt", hash = 0 },
+]
+
+[[licenses.clarify]]
+crate = "option_parser"
+expression = "Apache-2.0"
+license-files = [{ path = "../LICENSES/Apache-2.0.txt", hash = 0 }]
+
+[[licenses.clarify]]
+crate = "pci"
+expression = "Apache-2.0 AND BSD-3-Clause"
+license-files = [
+  { path = "../LICENSES/Apache-2.0.txt", hash = 0 },
+  { path = "../LICENSES/BSD-3-Clause.txt", hash = 0 },
+]
+
+[[licenses.clarify]]
+crate = "rate_limiter"
+expression = "Apache-2.0"
+license-files = [{ path = "../LICENSES/Apache-2.0.txt", hash = 0 }]
+
+[[licenses.clarify]]
+crate = "serial_buffer"
+expression = "Apache-2.0"
+license-files = [{ path = "../LICENSES/Apache-2.0.txt", hash = 0 }]
+
+[[licenses.clarify]]
+crate = "tracer"
+expression = "Apache-2.0"
+license-files = [{ path = "../LICENSES/Apache-2.0.txt", hash = 0 }]
+
+[[licenses.clarify]]
+crate = "virtio-devices"
+expression = "Apache-2.0 AND BSD-3-Clause"
+license-files = [
+  { path = "../LICENSES/Apache-2.0.txt", hash = 0 },
+  { path = "../LICENSES/BSD-3-Clause.txt", hash = 0 },
+]
+
+[[licenses.clarify]]
+crate = "vm-allocator"
+expression = "Apache-2.0 AND BSD-3-Clause"
+license-files = [
+  { path = "../LICENSES/Apache-2.0.txt", hash = 0 },
+  { path = "../LICENSES/BSD-3-Clause.txt", hash = 0 },
+]
+
+[[licenses.clarify]]
+crate = "vm-device"
+expression = "Apache-2.0"
+license-files = [{ path = "../LICENSES/Apache-2.0.txt", hash = 0 }]
+
+[[licenses.clarify]]
+crate = "vm-migration"
+expression = "Apache-2.0 AND BSD-3-Clause"
+license-files = [
+  { path = "../LICENSES/Apache-2.0.txt", hash = 0 },
+  { path = "../LICENSES/BSD-3-Clause.txt", hash = 0 },
+]
+
+[[licenses.clarify]]
+crate = "vm-virtio"
+expression = "Apache-2.0 AND BSD-3-Clause"
+license-files = [
+  { path = "../LICENSES/Apache-2.0.txt", hash = 0 },
+  { path = "../LICENSES/BSD-3-Clause.txt", hash = 0 },
+]
+
+[[licenses.clarify]]
+crate = "vmm"
+expression = "Apache-2.0 AND BSD-3-Clause"
+license-files = [
+  { path = "../LICENSES/Apache-2.0.txt", hash = 0 },
+  { path = "../LICENSES/BSD-3-Clause.txt", hash = 0 },
+]

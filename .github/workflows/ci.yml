@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt
+      - name: Check formatting
+        run: cargo +1.89.0 fmt --all -- --check
+      - name: Run workspace tests
+        run: cargo +1.89.0 test --workspace --locked
+
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install license auditor
+        run: cargo install cargo-deny --locked --version 0.20.2
+      - name: Audit dependencies
+        run: cargo deny check licenses advisories

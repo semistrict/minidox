@@ -2,6 +2,11 @@
 
 Shared Redox filesystem and page cache for microVMs over virtiofs DAX.
 
+> [!WARNING]
+> This is an experimental research prototype. It is not ready for production
+> workloads, and its persistence and snapshot formats do not have compatibility
+> guarantees yet.
+
 The page cache is extracted from RedoxFS's `Fmap` and `FileMmapInfo` design.
 One Supervisor-owned cache serves every VM in a filesystem lineage. Entries are
 keyed by stable Redox file-object identity, page offset, and the page version
@@ -24,6 +29,12 @@ the DAX windows of multiple VMs.
 The vendored trees retain their upstream licenses and history metadata. Update
 them with `git subtree pull` from full local clones of the canonical upstreams.
 
+## Platform support
+
+The complete VMM runs on Linux hosts with KVM. The platform-independent cache,
+filesystem, and fork-model tests also run on macOS. Nested virtualization and
+guest virtio-fs DAX support depend on the host and guest kernel configuration.
+
 ## Tests
 
 Run the platform-independent suites with `cargo test --workspace --locked`.
@@ -45,3 +56,9 @@ or testing fails. On an already-prepared native x86-64 Linux KVM host, pass
 `--native` to run the same test without provisioning GCE.
 Override its project, zone, machine type, or instance name with the corresponding
 `MINIDOX_GCE_*` environment variable.
+
+## License
+
+The original minidox code is licensed under the Apache License 2.0. Vendored
+code remains under its upstream license; see [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)
+and the license files inside each `vendor/` subtree.
