@@ -11,18 +11,20 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install Rust toolchain
         run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt
       - name: Check formatting
         run: cargo +1.89.0 fmt --all -- --check
+      - name: Enable KVM access
+        run: sudo chmod 0666 /dev/kvm
       - name: Run workspace tests
         run: cargo +1.89.0 test --workspace --locked
 
   licenses:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install license auditor
         run: cargo install cargo-deny --locked --version 0.20.2
       - name: Audit dependencies
