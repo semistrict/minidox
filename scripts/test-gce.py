@@ -381,8 +381,7 @@ def run_native() -> None:
                     str(REPO_ROOT / "Cargo.toml"),
                     "-p",
                     "minidox-vmm",
-                    "--test",
-                    "cloud_hypervisor_fork_state",
+                    "--tests",
                     "--locked",
                     "--",
                     "--nocapture",
@@ -393,8 +392,9 @@ def run_native() -> None:
         finally:
             if not succeeded:
                 print("guest console:", file=sys.stderr)
-                lines = console.read_text(errors="replace").splitlines()
-                print("\n".join(lines[-200:]), file=sys.stderr)
+                if console.exists():
+                    lines = console.read_text(errors="replace").splitlines()
+                    print("\n".join(lines[-200:]), file=sys.stderr)
 
 
 def parse_args() -> argparse.Namespace:

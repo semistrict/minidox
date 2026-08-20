@@ -159,6 +159,21 @@ impl DirtyBranch {
             .filter_map(|(key, dirty)| dirty.then_some(key))
             .collect()
     }
+
+    fn pages(&self) -> Vec<PageKey> {
+        let mut visible = self.changes.clone();
+        let mut generation = Some(&*self.base);
+        while let Some(current) = generation {
+            for (&key, &dirty) in &current.changes {
+                visible.entry(key).or_insert(dirty);
+            }
+            generation = current.parent.as_deref();
+        }
+        visible
+            .into_iter()
+            .filter_map(|(key, dirty)| dirty.then_some(key))
+            .collect()
+    }
 }
 
 struct State<S: ForkableNodeStore> {
@@ -204,6 +219,46 @@ impl<S: ForkableNodeStore> SharedPageCache<S> {
             },
             branch,
         )
+    }
+
+    /// Restore all Filesystem Branches in one lineage into one logical cache.
+    pub fn restore(stores: Vec<S>) -> Result<(Self, Vec<CacheBranchId>)> {
+        if stores.is_empty() {
+            return Err(CacheError::InvalidMapping(
+                "a filesystem lineage must contain at least one branch",
+            ));
+        }
+        let mut branches = BTreeMap::new();
+        let mut ids = Vec::with_capacity(stores.len());
+        for (index, store) in stores.into_iter().enumerate() {
+            let id = CacheBranchId((index + 1) as u64);
+            ids.push(id);
+            branches.insert(
+                id,
+                CacheBranch {
+                    store,
+                    open_nodes: BTreeMap::new(),
+                    active_pages: BTreeMap::new(),
+                    exclusive_pages: BTreeSet::new(),
+                    dirty_pages: DirtyBranch::new(),
+                },
+            );
+        }
+        let next_branch = (branches.len() as u64)
+            .checked_add(1)
+            .ok_or(CacheError::InvalidMapping("cache branch identity overflow"))?;
+        Ok((
+            Self {
+                id: NEXT_CACHE_ID.fetch_add(1, Ordering::Relaxed),
+                state: Mutex::new(State {
+                    next_branch,
+                    branches,
+                    pages: BTreeMap::new(),
+                    known_pages: BTreeSet::new(),
+                }),
+            },
+            ids,
+        ))
     }
 
     pub fn id(&self) -> u64 {
@@ -472,34 +527,24 @@ impl<S: ForkableNodeStore> SharedPageCache<S> {
 
     pub fn sync(&self, branch_id: CacheBranchId, node: NodeId) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        let State {
-            branches, pages, ..
-        } = &mut *state;
-        let branch = branches
-            .get_mut(&branch_id)
-            .ok_or(CacheError::BranchNotFound(branch_id.0))?;
-        let dirty_pages = branch.dirty_pages.pages_for_node(node);
-        let file_len = branch.store.len(node)?;
-        for key in dirty_pages {
-            if key.1 >= file_len {
-                branch.dirty_pages.mark_clean(key);
-                continue;
-            }
-            let identity = branch.store.page_identity(node, key.1)?;
-            let page = pages.get(&identity).ok_or(CacheError::StaleMapping)?;
-            let count = usize::try_from((file_len - key.1).min(PAGE_SIZE))
-                .map_err(|_| CacheError::InvalidMapping("page length does not fit usize"))?;
-            let mut bytes = [0; PAGE_SIZE as usize];
-            read_exact_at(&page.backing, &mut bytes[..count], 0)?;
-            let written = branch.store.write_node(node, key.1, &bytes[..count])?;
-            if written != count {
-                return Err(
-                    io::Error::new(io::ErrorKind::WriteZero, "short filesystem write").into(),
-                );
-            }
-            branch.dirty_pages.mark_clean(key);
-        }
-        Ok(())
+        let dirty_pages = state
+            .branches
+            .get(&branch_id)
+            .ok_or(CacheError::BranchNotFound(branch_id.0))?
+            .dirty_pages
+            .pages_for_node(node);
+        sync_pages(&mut state, branch_id, dirty_pages)
+    }
+
+    pub fn sync_all(&self, branch_id: CacheBranchId) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let dirty_pages = state
+            .branches
+            .get(&branch_id)
+            .ok_or(CacheError::BranchNotFound(branch_id.0))?
+            .dirty_pages
+            .pages();
+        sync_pages(&mut state, branch_id, dirty_pages)
     }
 
     pub fn page_accounting(
@@ -538,6 +583,39 @@ impl<S: ForkableNodeStore> SharedPageCache<S> {
             shared_pages: references.values().filter(|&&count| count > 1).count(),
         })
     }
+}
+
+fn sync_pages<S: ForkableNodeStore>(
+    state: &mut State<S>,
+    branch_id: CacheBranchId,
+    dirty_pages: Vec<PageKey>,
+) -> Result<()> {
+    let State {
+        branches, pages, ..
+    } = state;
+    let branch = branches
+        .get_mut(&branch_id)
+        .ok_or(CacheError::BranchNotFound(branch_id.0))?;
+    for key in dirty_pages {
+        let node = key.0;
+        let file_len = branch.store.len(node)?;
+        if key.1 >= file_len {
+            branch.dirty_pages.mark_clean(key);
+            continue;
+        }
+        let identity = branch.store.page_identity(node, key.1)?;
+        let page = pages.get(&identity).ok_or(CacheError::StaleMapping)?;
+        let count = usize::try_from((file_len - key.1).min(PAGE_SIZE))
+            .map_err(|_| CacheError::InvalidMapping("page length does not fit usize"))?;
+        let mut bytes = [0; PAGE_SIZE as usize];
+        read_exact_at(&page.backing, &mut bytes[..count], 0)?;
+        let written = branch.store.write_node(node, key.1, &bytes[..count])?;
+        if written != count {
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "short filesystem write").into());
+        }
+        branch.dirty_pages.mark_clean(key);
+    }
+    Ok(())
 }
 
 fn load_page<S: ForkableNodeStore>(

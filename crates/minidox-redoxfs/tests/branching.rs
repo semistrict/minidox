@@ -71,3 +71,39 @@ fn branch_exposes_root_directory_metadata_for_virtiofs() {
             .any(|entry| entry.id == node && entry.name == "guest-visible")
     );
 }
+
+#[test]
+fn durable_redox_disk_layers_restore_recursive_cow_sharing() {
+    let storage = tempfile::tempdir().unwrap();
+    let node;
+    let source_state;
+    let child_state;
+    {
+        let mut source = RedoxBranch::create_durable(storage.path(), 32 * 1024 * 1024).unwrap();
+        node = source.create_file("state", 8192).unwrap();
+        source.write(node, 128, b"shared").unwrap();
+
+        let mut child = source.fork().unwrap();
+        source.write(node, 4096, b"source").unwrap();
+        child.write(node, 4096, b"child!").unwrap();
+        source_state = source.durable_state().unwrap();
+        child_state = child.durable_state().unwrap();
+        source.write(node, 128, b"not saved").unwrap();
+        child.write(node, 128, b"not saved").unwrap();
+    }
+
+    let mut restored =
+        RedoxBranch::restore_lineage(storage.path(), vec![source_state, child_state]).unwrap();
+    let mut child = restored.pop().unwrap();
+    let mut source = restored.pop().unwrap();
+    assert_eq!(source.read(node, 128, 6).unwrap(), b"shared");
+    assert_eq!(child.read(node, 128, 6).unwrap(), b"shared");
+    assert_eq!(source.read(node, 4096, 6).unwrap(), b"source");
+    assert_eq!(child.read(node, 4096, 6).unwrap(), b"child!");
+    assert!(RedoxBranch::block_accounting([&source, &child]).shared_blocks > 0);
+
+    let mut grandchild = child.fork().unwrap();
+    child.write(node, 128, b"next!!").unwrap();
+    assert_eq!(child.read(node, 128, 6).unwrap(), b"next!!");
+    assert_eq!(grandchild.read(node, 128, 6).unwrap(), b"shared");
+}

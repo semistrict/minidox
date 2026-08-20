@@ -1003,6 +1003,8 @@ dependencies = [
  "minidox-cache",
  "redox_syscall",
  "redoxfs",
+ "serde",
+ "tempfile",
 ]
 
 [[package]]
@@ -1014,10 +1016,12 @@ dependencies = [
  "minidox-cache",
  "minidox-redoxfs",
  "seccompiler",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "virtio-devices",
+ "vm-migration",
  "vmm",
  "vmm-sys-util",
 ]

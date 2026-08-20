@@ -1,9 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use redoxfs::{BLOCK_SIZE, Disk, FileSystem, Node, TreePtr};
+use serde::{Deserialize, Serialize};
 use syscall::error::{EIO, Error, Result as SyscallResult};
 
 use minidox_cache::{ForkableNodeStore, NodeId, NodeStore, PAGE_SIZE};
@@ -11,6 +14,9 @@ use minidox_cache::{ForkableNodeStore, NodeId, NodeStore, PAGE_SIZE};
 static NEXT_BLOCK_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_FILE_OBJECT_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PAGE_VERSION: AtomicU64 = AtomicU64::new(1);
+static NEXT_DURABLE_LAYER_ID: AtomicU64 = AtomicU64::new(1);
+
+const LAYER_RECORD_SIZE: usize = 16 + BLOCK_SIZE as usize;
 
 type PageKey = (NodeId, u64);
 
@@ -38,6 +44,20 @@ impl IdentityGeneration {
                 .as_deref()
                 .and_then(|parent| parent.page_version(key))
         })
+    }
+
+    fn visible_files(&self, files: &mut BTreeMap<NodeId, u64>) {
+        if let Some(parent) = &self.parent {
+            parent.visible_files(files);
+        }
+        files.extend(self.files.iter().map(|(&node, &object)| (node, object)));
+    }
+
+    fn visible_pages(&self, pages: &mut BTreeMap<PageKey, u64>) {
+        if let Some(parent) = &self.parent {
+            parent.visible_pages(pages);
+        }
+        pages.extend(self.pages.iter().map(|(&key, &version)| (key, version)));
     }
 }
 
@@ -120,6 +140,20 @@ impl IdentityBranch {
         );
         self.page_identity(node, offset)
     }
+
+    fn visible_files(&self) -> BTreeMap<NodeId, u64> {
+        let mut files = BTreeMap::new();
+        self.base.visible_files(&mut files);
+        files.extend(self.files.iter().map(|(&node, &object)| (node, object)));
+        files
+    }
+
+    fn visible_pages(&self) -> BTreeMap<PageKey, u64> {
+        let mut pages = BTreeMap::new();
+        self.base.visible_pages(&mut pages);
+        pages.extend(self.pages.iter().map(|(&key, &version)| (key, version)));
+        pages
+    }
 }
 
 #[derive(Debug)]
@@ -132,6 +166,154 @@ struct Block {
 struct DiskGeneration {
     parent: Option<Arc<DiskGeneration>>,
     blocks: BTreeMap<u64, Arc<Block>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DurableDiskState {
+    pub size: u64,
+    pub layers: Vec<u64>,
+    pub overlay: u64,
+}
+
+#[derive(Debug)]
+struct DurableCowDisk {
+    directory: Arc<PathBuf>,
+    layers: Vec<u64>,
+    overlay_id: u64,
+    overlay: File,
+}
+
+impl DurableCowDisk {
+    fn create(directory: impl AsRef<Path>) -> io::Result<Self> {
+        let directory = Arc::new(directory.as_ref().to_path_buf());
+        fs::create_dir_all(directory.as_ref())?;
+        let (overlay_id, overlay) = create_numbered_file(&directory, "overlay")?;
+        sync_directory(&directory)?;
+        Ok(Self {
+            directory,
+            layers: Vec::new(),
+            overlay_id,
+            overlay,
+        })
+    }
+
+    fn restore(
+        directory: impl AsRef<Path>,
+        state: DurableDiskState,
+        objects: &mut BTreeMap<u64, Arc<Block>>,
+    ) -> io::Result<(Self, Arc<DiskGeneration>, BTreeMap<u64, Arc<Block>>)> {
+        let directory = Arc::new(directory.as_ref().to_path_buf());
+        let mut base_blocks = BTreeMap::new();
+        for &layer in &state.layers {
+            load_records(
+                &directory.join(format!("layer-{layer}")),
+                objects,
+                &mut base_blocks,
+            )?;
+        }
+        let overlay_path = directory.join(format!("overlay-{}", state.overlay));
+        let mut snapshot_writes = BTreeMap::new();
+        load_records(&overlay_path, objects, &mut snapshot_writes)?;
+        NEXT_DURABLE_LAYER_ID.fetch_max(
+            state
+                .layers
+                .iter()
+                .copied()
+                .chain(std::iter::once(state.overlay))
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
+            Ordering::Relaxed,
+        );
+        let mut live_layers = state.layers;
+        if overlay_path.metadata()?.len() > 0 {
+            let (layer, layer_path) = link_numbered_file(&directory, "layer", &overlay_path)?;
+            File::open(layer_path)?.sync_data()?;
+            live_layers.push(layer);
+        }
+        let (overlay_id, overlay) = create_numbered_file(&directory, "overlay")?;
+        sync_directory(&directory)?;
+        base_blocks.extend(snapshot_writes);
+        Ok((
+            Self {
+                directory,
+                layers: live_layers,
+                overlay_id,
+                overlay,
+            },
+            Arc::new(DiskGeneration {
+                parent: None,
+                blocks: base_blocks,
+            }),
+            BTreeMap::new(),
+        ))
+    }
+
+    fn append(&mut self, address: u64, block: &Block) -> io::Result<()> {
+        self.overlay.write_all(&address.to_le_bytes())?;
+        self.overlay.write_all(&block.id.to_le_bytes())?;
+        self.overlay.write_all(&block.bytes)?;
+        Ok(())
+    }
+
+    fn fork(&mut self, seal_overlay: bool) -> io::Result<Self> {
+        let child_layers = if seal_overlay {
+            let (layer_id, _) = link_numbered_file(
+                &self.directory,
+                "layer",
+                self.directory.join(format!("overlay-{}", self.overlay_id)),
+            )?;
+            self.layers.push(layer_id);
+            self.layers.clone()
+        } else {
+            self.layers.clone()
+        };
+
+        if seal_overlay {
+            let (overlay_id, overlay) = create_numbered_file(&self.directory, "overlay")?;
+            self.overlay_id = overlay_id;
+            self.overlay = overlay;
+        }
+        let (child_overlay_id, child_overlay) = create_numbered_file(&self.directory, "overlay")?;
+        Ok(Self {
+            directory: Arc::clone(&self.directory),
+            layers: child_layers,
+            overlay_id: child_overlay_id,
+            overlay: child_overlay,
+        })
+    }
+
+    fn checkpoint(&mut self, size: u64, seal_overlay: bool) -> io::Result<DurableDiskState> {
+        for layer in &self.layers {
+            File::open(self.directory.join(format!("layer-{layer}")))?.sync_data()?;
+        }
+        self.overlay.sync_data()?;
+        let state = DurableDiskState {
+            size,
+            layers: self.layers.clone(),
+            overlay: self.overlay_id,
+        };
+
+        let layer = if seal_overlay {
+            let (layer_id, layer_path) = link_numbered_file(
+                &self.directory,
+                "layer",
+                self.directory.join(format!("overlay-{}", self.overlay_id)),
+            )?;
+            File::open(layer_path)?.sync_data()?;
+            Some(layer_id)
+        } else {
+            None
+        };
+        let (next_overlay_id, next_overlay) = create_numbered_file(&self.directory, "overlay")?;
+        sync_directory(&self.directory)?;
+        if let Some(layer) = layer {
+            self.layers.push(layer);
+        }
+        self.overlay_id = next_overlay_id;
+        self.overlay = next_overlay;
+        Ok(state)
+    }
 }
 
 impl DiskGeneration {
@@ -155,11 +337,94 @@ impl DiskGeneration {
     }
 }
 
+fn next_durable_id() -> u64 {
+    NEXT_DURABLE_LAYER_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn create_numbered_file(directory: &Path, prefix: &str) -> io::Result<(u64, File)> {
+    loop {
+        let id = next_durable_id();
+        let path = directory.join(format!("{prefix}-{id}"));
+        match OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(file) => return Ok((id, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn link_numbered_file(
+    directory: &Path,
+    prefix: &str,
+    source: impl AsRef<Path>,
+) -> io::Result<(u64, PathBuf)> {
+    loop {
+        let id = next_durable_id();
+        let path = directory.join(format!("{prefix}-{id}"));
+        match fs::hard_link(source.as_ref(), &path) {
+            Ok(()) => return Ok((id, path)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn load_records(
+    path: &Path,
+    objects: &mut BTreeMap<u64, Arc<Block>>,
+    visible: &mut BTreeMap<u64, Arc<Block>>,
+) -> io::Result<()> {
+    let bytes = fs::read(path)?;
+    if bytes.len() % LAYER_RECORD_SIZE != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "filesystem layer {} ends with a partial block record",
+                path.display()
+            ),
+        ));
+    }
+    for record in bytes.chunks_exact(LAYER_RECORD_SIZE) {
+        let address = u64::from_le_bytes(record[..8].try_into().unwrap());
+        let id = u64::from_le_bytes(record[8..16].try_into().unwrap());
+        let block_bytes: [u8; BLOCK_SIZE as usize] = record[16..].try_into().unwrap();
+        let block = if let Some(existing) = objects.get(&id) {
+            if existing.bytes != block_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("filesystem block object {id} has conflicting contents"),
+                ));
+            }
+            Arc::clone(existing)
+        } else {
+            let block = Arc::new(Block {
+                id,
+                bytes: block_bytes,
+            });
+            objects.insert(id, Arc::clone(&block));
+            block
+        };
+        NEXT_BLOCK_ID.fetch_max(id.saturating_add(1), Ordering::Relaxed);
+        visible.insert(address, block);
+    }
+    Ok(())
+}
+
+fn sync_directory(directory: &Path) -> io::Result<()> {
+    File::open(directory)?.sync_all()
+}
+
 #[derive(Debug)]
 struct CowDisk {
     size: u64,
     base: Arc<DiskGeneration>,
     writes: BTreeMap<u64, Arc<Block>>,
+    durable: Option<DurableCowDisk>,
 }
 
 impl CowDisk {
@@ -168,22 +433,39 @@ impl CowDisk {
             size,
             base: Arc::new(DiskGeneration::default()),
             writes: BTreeMap::new(),
+            durable: None,
         }
     }
 
-    fn fork(&mut self) -> Self {
-        if !self.writes.is_empty() {
+    fn durable(directory: impl AsRef<Path>, size: u64) -> io::Result<Self> {
+        Ok(Self {
+            size,
+            base: Arc::new(DiskGeneration::default()),
+            writes: BTreeMap::new(),
+            durable: Some(DurableCowDisk::create(directory)?),
+        })
+    }
+
+    fn fork(&mut self) -> io::Result<Self> {
+        let has_writes = !self.writes.is_empty();
+        let child_durable = self
+            .durable
+            .as_mut()
+            .map(|durable| durable.fork(has_writes))
+            .transpose()?;
+        if has_writes {
             self.base = Arc::new(DiskGeneration {
                 parent: Some(self.base.clone()),
                 blocks: std::mem::take(&mut self.writes),
             });
         }
 
-        Self {
+        Ok(Self {
             size: self.size,
             base: self.base.clone(),
             writes: BTreeMap::new(),
-        }
+            durable: child_durable,
+        })
     }
 
     fn visible_block(&self, block: u64) -> Option<&Arc<Block>> {
@@ -212,6 +494,23 @@ impl CowDisk {
             return Err(Error::new(EIO));
         }
         Ok(())
+    }
+
+    fn durable_state(&mut self) -> io::Result<DurableDiskState> {
+        let size = self.size;
+        let has_writes = !self.writes.is_empty();
+        let state = self
+            .durable
+            .as_mut()
+            .ok_or_else(|| io::Error::other("filesystem branch is not durable"))?
+            .checkpoint(size, has_writes)?;
+        if has_writes {
+            self.base = Arc::new(DiskGeneration {
+                parent: Some(Arc::clone(&self.base)),
+                blocks: std::mem::take(&mut self.writes),
+            });
+        }
+        Ok(state)
     }
 }
 
@@ -246,6 +545,11 @@ impl Disk for CowDisk {
                     bytes,
                 }),
             );
+            if let Some(durable) = &mut self.durable {
+                durable
+                    .append(address, &self.writes[&address])
+                    .map_err(|_| Error::new(EIO))?;
+            }
         }
         Ok(buffer.len())
     }
@@ -281,6 +585,28 @@ pub struct DirectoryEntry {
     pub name: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RedoxFileIdentity {
+    pub node: NodeId,
+    pub object: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RedoxPageVersion {
+    pub node: NodeId,
+    pub page: u64,
+    pub version: u64,
+}
+
+/// Durable branch metadata. RedoxFS block data remains in native Disk layers.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RedoxBranchState {
+    pub disk: DurableDiskState,
+    pub header_block: u64,
+    pub files: Vec<RedoxFileIdentity>,
+    pub pages: Vec<RedoxPageVersion>,
+}
+
 /// An independently writable RedoxFS branch over shared immutable disk blocks.
 pub struct RedoxBranch {
     fs: FileSystem<CowDisk>,
@@ -290,6 +616,14 @@ pub struct RedoxBranch {
 impl RedoxBranch {
     pub fn create(size: u64) -> io::Result<Self> {
         let fs = FileSystem::create(CowDisk::new(size), None, 1, 0).map_err(io_error)?;
+        let mut identities = IdentityBranch::new();
+        identities.create_file(TreePtr::<Node>::root().id());
+        Ok(Self { fs, identities })
+    }
+
+    pub fn create_durable(directory: impl AsRef<Path>, size: u64) -> io::Result<Self> {
+        let fs =
+            FileSystem::create(CowDisk::durable(directory, size)?, None, 1, 0).map_err(io_error)?;
         let mut identities = IdentityBranch::new();
         identities.create_file(TreePtr::<Node>::root().id());
         Ok(Self { fs, identities })
@@ -377,7 +711,7 @@ impl RedoxBranch {
     }
 
     pub fn fork(&mut self) -> io::Result<Self> {
-        let child_disk = self.fs.disk.fork();
+        let child_disk = self.fs.disk.fork()?;
         let child_identities = self.identities.fork();
         let child =
             FileSystem::open(child_disk, None, Some(self.fs.block), false).map_err(io_error)?;
@@ -385,6 +719,81 @@ impl RedoxBranch {
             fs: child,
             identities: child_identities,
         })
+    }
+
+    pub fn durable_state(&mut self) -> io::Result<RedoxBranchState> {
+        let disk = self.fs.disk.durable_state()?;
+        let files = self
+            .identities
+            .visible_files()
+            .into_iter()
+            .map(|(node, object)| RedoxFileIdentity { node, object })
+            .collect();
+        let pages = self
+            .identities
+            .visible_pages()
+            .into_iter()
+            .map(|((node, page), version)| RedoxPageVersion {
+                node,
+                page,
+                version,
+            })
+            .collect();
+        Ok(RedoxBranchState {
+            disk,
+            header_block: self.fs.block,
+            files,
+            pages,
+        })
+    }
+
+    pub fn restore_lineage(
+        directory: impl AsRef<Path>,
+        states: Vec<RedoxBranchState>,
+    ) -> io::Result<Vec<Self>> {
+        let mut objects = BTreeMap::new();
+        let mut max_file = 0;
+        let mut max_version = 0;
+        let mut branches = Vec::with_capacity(states.len());
+        for state in states {
+            let (durable, base, writes) =
+                DurableCowDisk::restore(directory.as_ref(), state.disk.clone(), &mut objects)?;
+            let disk = CowDisk {
+                size: state.disk.size,
+                base,
+                writes,
+                durable: Some(durable),
+            };
+            let fs =
+                FileSystem::open(disk, None, Some(state.header_block), false).map_err(io_error)?;
+            let files = state
+                .files
+                .into_iter()
+                .map(|identity| {
+                    max_file = max_file.max(identity.object);
+                    (identity.node, identity.object)
+                })
+                .collect();
+            let pages = state
+                .pages
+                .into_iter()
+                .map(|page| {
+                    max_version = max_version.max(page.version);
+                    ((page.node, page.page), page.version)
+                })
+                .collect();
+            branches.push(Self {
+                fs,
+                identities: IdentityBranch {
+                    base: Arc::new(IdentityGeneration::default()),
+                    files,
+                    pages,
+                },
+            });
+        }
+        NEXT_FILE_OBJECT_ID.fetch_max(max_file.saturating_add(1), Ordering::Relaxed);
+        NEXT_PAGE_VERSION.fetch_max(max_version.saturating_add(1), Ordering::Relaxed);
+        Ok(branches)
     }
 
     pub fn block_accounting<'a>(branches: impl IntoIterator<Item = &'a Self>) -> BlockAccounting {

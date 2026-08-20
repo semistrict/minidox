@@ -8,3 +8,7 @@ rust-version.workspace = true
 minidox-cache.workspace = true
 redoxfs.workspace = true
 redox_syscall.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -3,7 +3,8 @@
 mod branching;
 
 pub use branching::{
-    BlockAccounting, DirectoryEntry, NodeMetadata, RedoxBranch, RedoxPageIdentity,
+    BlockAccounting, DirectoryEntry, DurableDiskState, NodeMetadata, RedoxBranch, RedoxBranchState,
+    RedoxPageIdentity,
 };
 
 use std::io;

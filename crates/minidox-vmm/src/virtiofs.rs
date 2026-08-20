@@ -8,7 +8,8 @@ use minidox_cache::{
     CacheBranchId, CacheError, CachePageAccounting, DaxPageMapping, MapFlags, NodeId, NodeStore,
     PAGE_SIZE, SharedPageCache,
 };
-use minidox_redoxfs::{NodeMetadata, RedoxBranch};
+use minidox_redoxfs::{NodeMetadata, RedoxBranch, RedoxBranchState};
+use serde::{Deserialize, Serialize};
 use virtio_devices::{FsDirEntry, FsNodeAttr, InProcessFsBackend, register_in_process_fs};
 
 use crate::Error;
@@ -16,15 +17,31 @@ use crate::Error;
 const FILESYSTEM_SIZE: u64 = 32 * 1024 * 1024;
 const DAX_WINDOW_SIZE: u64 = 16 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 struct MappingSpec {
     inode: NodeId,
     file_offset: u64,
     writable: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct DurableMappingSpec {
+    window_offset: u64,
+    inode: NodeId,
+    file_offset: u64,
+    writable: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct VirtioFsSnapshot {
+    pub(crate) lineage: u64,
+    pub(crate) filesystem: RedoxBranchState,
+    mappings: Vec<DurableMappingSpec>,
+}
+
 struct State {
     cache: Arc<SharedPageCache<RedoxBranch>>,
+    lineage: u64,
     branch: CacheBranchId,
     window: Option<(usize, usize)>,
     specs: BTreeMap<u64, MappingSpec>,
@@ -55,11 +72,23 @@ impl VirtioFsBranch {
         let filesystem = RedoxBranch::create(FILESYSTEM_SIZE)
             .map_err(|error| Error::backend("create RedoxFS branch", error))?;
         let (cache, branch) = SharedPageCache::new(filesystem);
-        Self::from_parts(Arc::new(cache), branch, BTreeMap::new())
+        let lineage = cache.id();
+        Self::from_parts(Arc::new(cache), lineage, branch, BTreeMap::new())
+    }
+
+    pub(crate) fn create_durable(
+        lineage: u64,
+        directory: impl AsRef<std::path::Path>,
+    ) -> Result<Arc<Self>, Error> {
+        let filesystem = RedoxBranch::create_durable(directory, FILESYSTEM_SIZE)
+            .map_err(|error| Error::backend("create durable RedoxFS branch", error))?;
+        let (cache, branch) = SharedPageCache::new(filesystem);
+        Self::from_parts(Arc::new(cache), lineage, branch, BTreeMap::new())
     }
 
     fn from_parts(
         cache: Arc<SharedPageCache<RedoxBranch>>,
+        lineage: u64,
         branch_id: CacheBranchId,
         specs: BTreeMap<u64, MappingSpec>,
     ) -> Result<Arc<Self>, Error> {
@@ -75,6 +104,7 @@ impl VirtioFsBranch {
         let branch = Arc::new(Self {
             state: Mutex::new(State {
                 cache,
+                lineage,
                 branch: branch_id,
                 window: None,
                 specs,
@@ -104,14 +134,95 @@ impl VirtioFsBranch {
         let child = state
             .cache
             .fork(state.branch)
-            .map(|branch| (Arc::clone(&state.cache), branch, state.specs.clone()))
+            .map(|branch| {
+                (
+                    Arc::clone(&state.cache),
+                    state.lineage,
+                    branch,
+                    state.specs.clone(),
+                )
+            })
             .map_err(|error| Error::backend("fork RedoxFS/DAX branch", error));
         let resume = resume_mappings(&mut state)
             .map_err(|error| Error::backend("resume DAX mappings", error));
-        let (child_cache, child_branch, child_specs) = child?;
+        let (child_cache, lineage, child_branch, child_specs) = child?;
         resume?;
         drop(state);
-        Self::from_parts(child_cache, child_branch, child_specs)
+        Self::from_parts(child_cache, lineage, child_branch, child_specs)
+    }
+
+    pub(crate) fn durable_snapshot(&self) -> Result<VirtioFsSnapshot, Error> {
+        let mut state = self.state.lock().unwrap();
+        suspend_mappings(&mut state)
+            .map_err(|error| Error::backend("suspend DAX mappings for checkpoint", error))?;
+        let result = (|| {
+            state
+                .cache
+                .sync_all(state.branch)
+                .map_err(|error| Error::backend("sync DAX pages for checkpoint", error))?;
+            let filesystem = state
+                .cache
+                .with_store_mut(state.branch, RedoxBranch::durable_state)
+                .map_err(|error| Error::backend("snapshot RedoxFS branch", error))?;
+            let mappings = state
+                .specs
+                .iter()
+                .map(|(&window_offset, spec)| DurableMappingSpec {
+                    window_offset,
+                    inode: spec.inode,
+                    file_offset: spec.file_offset,
+                    writable: spec.writable,
+                })
+                .collect();
+            Ok::<_, Error>(VirtioFsSnapshot {
+                lineage: state.lineage,
+                filesystem,
+                mappings,
+            })
+        })();
+        let resume = resume_mappings(&mut state)
+            .map_err(|error| Error::backend("resume DAX mappings after checkpoint", error));
+        let snapshot = result?;
+        resume?;
+        Ok(snapshot)
+    }
+
+    pub(crate) fn restore_lineage(
+        directory: impl AsRef<std::path::Path>,
+        snapshots: Vec<VirtioFsSnapshot>,
+    ) -> Result<Vec<Arc<Self>>, Error> {
+        let stores = RedoxBranch::restore_lineage(
+            directory,
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.filesystem.clone())
+                .collect(),
+        )
+        .map_err(|error| Error::backend("restore RedoxFS lineage", error))?;
+        let (cache, branches) = SharedPageCache::restore(stores)
+            .map_err(|error| Error::backend("restore shared filesystem cache", error))?;
+        let cache = Arc::new(cache);
+        snapshots
+            .into_iter()
+            .zip(branches)
+            .map(|(snapshot, branch)| {
+                let specs = snapshot
+                    .mappings
+                    .into_iter()
+                    .map(|mapping| {
+                        (
+                            mapping.window_offset,
+                            MappingSpec {
+                                inode: mapping.inode,
+                                file_offset: mapping.file_offset,
+                                writable: mapping.writable,
+                            },
+                        )
+                    })
+                    .collect();
+                Self::from_parts(Arc::clone(&cache), snapshot.lineage, branch, specs)
+            })
+            .collect()
     }
 
     pub(crate) fn create_file(&self, name: &str, size: u64) -> Result<NodeId, Error> {

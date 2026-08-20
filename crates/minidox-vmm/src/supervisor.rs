@@ -1,21 +1,65 @@
 use std::collections::BTreeMap;
-use std::io;
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cloud_hypervisor::vm_config::{FsConfig, PciDeviceCommonConfig};
 use cloud_hypervisor_hypervisor::{Hypervisor, HypervisorVmConfig, Vm};
 use minidox_cache::{CacheError, CachePageAccounting, NodeId};
+use serde::{Deserialize, Serialize};
+use vm_migration::Snapshot;
+use vm_migration::protocol::MemoryRangeTable;
 
-use crate::virtiofs::VirtioFsBranch;
-use crate::{CloudHypervisorVm, KvmGuestRam, RamAccounting, VmConfig};
+use crate::ram::RamState;
+use crate::virtiofs::{VirtioFsBranch, VirtioFsSnapshot};
+use crate::{CloudHypervisorVm, KvmGuestRam, RamAccounting, VmConfig, VmForkStateCapture};
 
 const RAM_SLOT: u32 = 0;
 const RAM_GPA: u64 = 0;
+const MANIFEST_VERSION: u32 = 1;
+
+#[derive(Deserialize, Serialize)]
+struct ForestManifest {
+    version: u32,
+    next_vm: u64,
+    next_lineage: u64,
+    vms: Vec<VmManifest>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct VmManifest {
+    id: u64,
+    backend: DurableBackend,
+    ram: RamState,
+    filesystem: VirtioFsSnapshot,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DurableBackend {
+    Raw,
+    Cloud {
+        config: Box<VmConfig>,
+        snapshot: Snapshot,
+        dirty_memory: MemoryRangeTable,
+        in_process_filesystems: Vec<usize>,
+    },
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct KvmVmId(u64);
+
+impl KvmVmId {
+    pub const fn from_raw(id: u64) -> Self {
+        Self(id)
+    }
+
+    pub const fn into_raw(self) -> u64 {
+        self.0
+    }
+}
 
 struct SupervisedVm {
     backend: VmBackend,
@@ -66,8 +110,10 @@ pub struct KvmForkAccounting {
 pub struct KvmSupervisor {
     hypervisor: Arc<dyn Hypervisor>,
     next_vm: u64,
+    next_lineage: u64,
     vms: BTreeMap<KvmVmId, SupervisedVm>,
     last_fork_pause: Option<Duration>,
+    storage: Option<PathBuf>,
 }
 
 impl KvmSupervisor {
@@ -76,8 +122,126 @@ impl KvmSupervisor {
             hypervisor: cloud_hypervisor_hypervisor::new()
                 .map_err(|error| SupervisorError::backend("create KVM hypervisor", error))?,
             next_vm: 1,
+            next_lineage: 1,
             vms: BTreeMap::new(),
             last_fork_pause: None,
+            storage: None,
+        })
+    }
+
+    /// Open a durable fork forest, restoring its last completed checkpoint.
+    pub fn open(directory: impl AsRef<Path>) -> Result<Self, SupervisorError> {
+        let storage = directory.as_ref().to_path_buf();
+        fs::create_dir_all(storage.join("ram/generations"))?;
+        fs::create_dir_all(storage.join("filesystems"))?;
+        KvmGuestRam::reserve_persisted_generation_ids(&storage.join("ram/generations"))?;
+        let manifest_path = storage.join("forest.json");
+        if !manifest_path.exists() {
+            let mut supervisor = Self::new()?;
+            supervisor.storage = Some(storage);
+            return Ok(supervisor);
+        }
+
+        let manifest: ForestManifest = serde_json::from_reader(File::open(&manifest_path)?)?;
+        if manifest.version != MANIFEST_VERSION {
+            return Err(SupervisorError::UnsupportedManifestVersion(
+                manifest.version,
+            ));
+        }
+
+        let hypervisor = cloud_hypervisor_hypervisor::new()
+            .map_err(|error| SupervisorError::backend("create KVM hypervisor", error))?;
+        let rams = KvmGuestRam::restore(
+            manifest.vms.iter().map(|vm| vm.ram.clone()).collect(),
+            &storage.join("ram/generations"),
+        )?;
+
+        let mut by_lineage = BTreeMap::<u64, Vec<(usize, VirtioFsSnapshot)>>::new();
+        for (index, vm) in manifest.vms.iter().enumerate() {
+            by_lineage
+                .entry(vm.filesystem.lineage)
+                .or_default()
+                .push((index, vm.filesystem.clone()));
+        }
+        let mut filesystems = vec![None; manifest.vms.len()];
+        for (lineage, entries) in by_lineage {
+            let indexes = entries.iter().map(|(index, _)| *index).collect::<Vec<_>>();
+            let snapshots = entries.into_iter().map(|(_, snapshot)| snapshot).collect();
+            let restored = VirtioFsBranch::restore_lineage(
+                storage.join("filesystems").join(lineage.to_string()),
+                snapshots,
+            )?;
+            for (index, filesystem) in indexes.into_iter().zip(restored) {
+                filesystems[index] = Some(filesystem);
+            }
+        }
+
+        let mut vms = BTreeMap::new();
+        for ((saved, ram), filesystem) in manifest.vms.into_iter().zip(rams).zip(filesystems) {
+            let filesystem = filesystem.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing restored filesystem branch",
+                )
+            })?;
+            let backend = match saved.backend {
+                DurableBackend::Raw => {
+                    let vm = hypervisor
+                        .create_vm(HypervisorVmConfig::default())
+                        .map_err(|error| SupervisorError::backend("restore KVM VM", error))?;
+                    ram.register(vm.as_ref(), RAM_SLOT, RAM_GPA)?;
+                    VmBackend::Raw(vm)
+                }
+                DurableBackend::Cloud {
+                    mut config,
+                    snapshot,
+                    dirty_memory,
+                    in_process_filesystems,
+                } => {
+                    if let Some(configured) = config.fs.as_mut() {
+                        for index in in_process_filesystems {
+                            let item = configured.get_mut(index).ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "in-process filesystem index is outside VM config",
+                                )
+                            })?;
+                            item.in_process_backend_id = Some(filesystem.backend_id());
+                            item.dax_window_size = filesystem.dax_window_size();
+                        }
+                    }
+                    let vm = CloudHypervisorVm::start()?;
+                    vm.restore_fork_state(
+                        VmForkStateCapture {
+                            config,
+                            snapshot,
+                            dirty_memory,
+                            dirty_ram_pages: Vec::new(),
+                        },
+                        &ram,
+                    )?;
+                    vm.begin_fork_tracking()?;
+                    vm.resume()?;
+                    VmBackend::Cloud(vm)
+                }
+            };
+            vms.insert(
+                KvmVmId(saved.id),
+                SupervisedVm {
+                    backend,
+                    ram,
+                    filesystem,
+                },
+            );
+        }
+
+        Ok(Self {
+            hypervisor,
+            next_vm: manifest.next_vm,
+            next_lineage: manifest.next_lineage,
+            vms,
+            last_fork_pause: None,
+            storage: Some(storage),
         })
     }
 
@@ -88,7 +252,7 @@ impl KvmSupervisor {
             .map_err(|error| SupervisorError::backend("create KVM VM", error))?;
         let ram = KvmGuestRam::new(ram_size)?;
         ram.register(vm.as_ref(), RAM_SLOT, RAM_GPA)?;
-        let filesystem = match VirtioFsBranch::create() {
+        let filesystem = match self.create_filesystem() {
             Ok(filesystem) => filesystem,
             Err(error) => {
                 let _ = ram.unregister(vm.as_ref(), RAM_SLOT, RAM_GPA);
@@ -113,7 +277,7 @@ impl KvmSupervisor {
         let ram_size = usize::try_from(config.memory.size)
             .map_err(|_| crate::Error::InvalidRamSize(usize::MAX))?;
         let ram = KvmGuestRam::new(ram_size)?;
-        let filesystem = VirtioFsBranch::create()?;
+        let filesystem = self.create_filesystem()?;
         config.fs.get_or_insert_with(Vec::new).push(FsConfig {
             pci_common: PciDeviceCommonConfig::default(),
             tag: "minidox".to_owned(),
@@ -275,6 +439,84 @@ impl KvmSupervisor {
             .ok_or(SupervisorError::VmNotFound(vm))
     }
 
+    /// Atomically publish the current durable RAM and RedoxFS roots.
+    pub fn checkpoint(&mut self) -> Result<(), SupervisorError> {
+        let storage = self
+            .storage
+            .clone()
+            .ok_or(SupervisorError::DurabilityRequired)?;
+
+        let mut paused = Vec::with_capacity(self.vms.len());
+        for (&id, vm) in &self.vms {
+            if let Err(error) = vm.backend.pause() {
+                for paused_id in paused.into_iter().rev() {
+                    let _ = self.vms[&paused_id].backend.resume();
+                }
+                return Err(error);
+            }
+            paused.push(id);
+        }
+
+        let checkpoint_result = (|| {
+            let mut saved = Vec::with_capacity(self.vms.len());
+            for (&id, vm) in &mut self.vms {
+                let backend = match &vm.backend {
+                    VmBackend::Raw(raw) => {
+                        vm.ram
+                            .seal_for_checkpoint(raw.as_ref(), RAM_SLOT, RAM_GPA)?;
+                        DurableBackend::Raw
+                    }
+                    VmBackend::Cloud(cloud) => {
+                        let capture = cloud.capture_fork_state()?;
+                        vm.ram.seal_dirty_pages(&capture.dirty_ram_pages)?;
+                        let in_process_filesystems = capture
+                            .config
+                            .fs
+                            .iter()
+                            .flatten()
+                            .enumerate()
+                            .filter_map(|(index, filesystem)| {
+                                filesystem.in_process_backend_id.map(|_| index)
+                            })
+                            .collect();
+                        DurableBackend::Cloud {
+                            config: capture.config,
+                            snapshot: capture.snapshot,
+                            dirty_memory: capture.dirty_memory,
+                            in_process_filesystems,
+                        }
+                    }
+                };
+                let filesystem = vm.filesystem.durable_snapshot()?;
+                let ram = vm.ram.durable_state(&storage.join("ram/generations"))?;
+                saved.push(VmManifest {
+                    id: id.0,
+                    backend,
+                    ram,
+                    filesystem,
+                });
+            }
+            Ok::<_, SupervisorError>(ForestManifest {
+                version: MANIFEST_VERSION,
+                next_vm: self.next_vm,
+                next_lineage: self.next_lineage,
+                vms: saved,
+            })
+        })();
+
+        let mut resume_result = Ok(());
+        for id in paused.into_iter().rev() {
+            if let Err(error) = self.vms[&id].backend.resume()
+                && resume_result.is_ok()
+            {
+                resume_result = Err(error);
+            }
+        }
+        let manifest = checkpoint_result?;
+        resume_result?;
+        publish_manifest(&storage, &manifest)
+    }
+
     pub fn write_memory(
         &mut self,
         vm: KvmVmId,
@@ -360,6 +602,23 @@ impl KvmSupervisor {
         self.last_fork_pause
     }
 
+    pub fn vm_ids(&self) -> Vec<KvmVmId> {
+        self.vms.keys().copied().collect()
+    }
+
+    fn create_filesystem(&mut self) -> Result<Arc<VirtioFsBranch>, SupervisorError> {
+        let Some(storage) = &self.storage else {
+            return VirtioFsBranch::create().map_err(Into::into);
+        };
+        let lineage = self.next_lineage;
+        self.next_lineage += 1;
+        VirtioFsBranch::create_durable(
+            lineage,
+            storage.join("filesystems").join(lineage.to_string()),
+        )
+        .map_err(Into::into)
+    }
+
     fn vm(&self, id: KvmVmId) -> Result<&SupervisedVm, SupervisorError> {
         self.vms.get(&id).ok_or(SupervisorError::VmNotFound(id))
     }
@@ -379,11 +638,29 @@ pub enum SupervisorError {
     Cache(#[from] CacheError),
     #[error(transparent)]
     Io(#[from] io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("manifest version {0} is not supported")]
+    UnsupportedManifestVersion(u32),
+    #[error("checkpoint requires a supervisor opened with durable storage")]
+    DurabilityRequired,
     #[error("{operation}: {message}")]
     Backend {
         operation: &'static str,
         message: String,
     },
+}
+
+fn publish_manifest(storage: &Path, manifest: &ForestManifest) -> Result<(), SupervisorError> {
+    let mut temporary = tempfile::NamedTempFile::new_in(storage)?;
+    serde_json::to_writer(&mut temporary, manifest)?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(storage.join("forest.json"))
+        .map_err(|error| error.error)?;
+    File::open(storage)?.sync_all()?;
+    Ok(())
 }
 
 impl SupervisorError {

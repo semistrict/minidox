@@ -97,23 +97,24 @@ fn run_from_start(vcpu: &mut dyn Vcpu) {
     }
 
     vcpu.set_regs(&regs).unwrap();
-    assert!(matches!(
-        vcpu.run().unwrap(),
-        VmExit::Ignore | VmExit::Reset | VmExit::Shutdown
-    ));
+    for _ in 0..1000 {
+        match vcpu.run().unwrap() {
+            VmExit::Ignore => continue,
+            VmExit::Reset | VmExit::Shutdown => return,
+            exit => panic!("unexpected vCPU exit: {exit:?}"),
+        }
+    }
+    panic!("vCPU did not reach the guest program's terminal exit");
 }
 
 #[cfg(target_arch = "x86_64")]
 fn guest_program(value: u32) -> Vec<u8> {
+    let value = u16::try_from(value).unwrap();
     let mut code = vec![
-        0x48, 0xc7, 0xc0, 0x00, 0x10, 0x00, 0x00, // mov rax, 0x1000
-        0x48, 0xc7, 0xc3, // mov rbx, value
+        0xc7, 0x06, 0x00, 0x10, // mov word ptr [0x1000], value
     ];
     code.extend_from_slice(&value.to_le_bytes());
-    code.extend_from_slice(&[
-        0x48, 0x89, 0x18, // mov [rax], rbx
-        0xf4, // hlt
-    ]);
+    code.push(0xf4); // hlt
     code
 }
 

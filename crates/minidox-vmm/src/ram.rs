@@ -1,13 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
+use std::path::Path;
 use std::ptr::NonNull;
 use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use cloud_hypervisor_hypervisor::Vm;
+use serde::{Deserialize, Serialize};
 
 use crate::Error;
 
@@ -59,6 +62,19 @@ pub struct RamAccounting {
     pub backing_files: usize,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct RamPageState {
+    id: u64,
+    generation: u64,
+    offset: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct RamState {
+    pub(crate) len: usize,
+    pub(crate) pages: Vec<RamPageState>,
+}
+
 /// A contiguous KVM memory slot backed by page-granular immutable generations.
 ///
 /// The first incarnation is shared with its page files. The first fork seals
@@ -92,6 +108,27 @@ impl RamForkBranch {
 }
 
 impl KvmGuestRam {
+    pub(crate) fn reserve_persisted_generation_ids(directory: &Path) -> Result<(), Error> {
+        let mut next = 1;
+        for entry in fs::read_dir(directory)
+            .map_err(|error| Error::backend("scan RAM generation directory", error))?
+        {
+            let entry =
+                entry.map_err(|error| Error::backend("scan RAM generation directory", error))?;
+            let name = entry.file_name();
+            let Some(id) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix("generation-"))
+                .and_then(|id| id.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            next = next.max(id.saturating_add(1));
+        }
+        NEXT_GENERATION_ID.fetch_max(next, Ordering::Relaxed);
+        Ok(())
+    }
+
     pub fn new(len: usize) -> Result<Self, Error> {
         if len == 0 || !len.is_multiple_of(RAM_PAGE_SIZE) {
             return Err(Error::InvalidRamSize(len));
@@ -240,6 +277,160 @@ impl KvmGuestRam {
         self.fork_pages(dirty)
     }
 
+    pub(crate) fn seal_for_checkpoint(
+        &mut self,
+        vm: &dyn Vm,
+        slot: u32,
+        guest_phys_addr: u64,
+    ) -> Result<(), Error> {
+        let bitmap = vm
+            .get_dirty_log(slot, guest_phys_addr, self.len as u64)
+            .map_err(|error| Error::backend("read KVM dirty log for checkpoint", error))?;
+        let mut dirty = self.host_dirty.clone();
+        for (word_index, word) in bitmap.into_iter().enumerate() {
+            for bit in 0..64 {
+                if word & (1_u64 << bit) != 0 {
+                    let page = word_index * 64 + bit;
+                    if page < self.pages.len() {
+                        dirty.insert(page);
+                    }
+                }
+            }
+        }
+        self.seal_pages(dirty)
+    }
+
+    pub(crate) fn seal_dirty_pages(&mut self, pages: &[usize]) -> Result<(), Error> {
+        let mut dirty = self.host_dirty.clone();
+        for &page in pages {
+            if page >= self.pages.len() {
+                return Err(Error::InvalidDirtyPage {
+                    page,
+                    pages: self.pages.len(),
+                });
+            }
+            dirty.insert(page);
+        }
+        self.seal_pages(dirty)
+    }
+
+    pub(crate) fn durable_state(&self, directory: &Path) -> Result<RamState, Error> {
+        fs::create_dir_all(directory)
+            .map_err(|error| Error::backend("create RAM generation directory", error))?;
+        let mut persisted = BTreeSet::new();
+        for page in &self.pages {
+            if persisted.insert(page.generation.id) {
+                persist_generation(directory, &page.generation)?;
+            }
+        }
+        File::open(directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| Error::backend("sync RAM generation directory", error))?;
+        Ok(RamState {
+            len: self.len,
+            pages: self
+                .pages
+                .iter()
+                .map(|page| RamPageState {
+                    id: page.id,
+                    generation: page.generation.id,
+                    offset: page.offset,
+                })
+                .collect(),
+        })
+    }
+
+    pub(crate) fn restore(states: Vec<RamState>, directory: &Path) -> Result<Vec<Self>, Error> {
+        let generation_ids = states
+            .iter()
+            .flat_map(|state| state.pages.iter().map(|page| page.generation))
+            .collect::<BTreeSet<_>>();
+        let mut generations = BTreeMap::new();
+        for id in generation_ids {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(directory.join(format!("generation-{id}")))
+                .map_err(|error| Error::backend("open durable RAM generation", error))?;
+            generations.insert(id, Arc::new(RamGeneration { id, file }));
+        }
+
+        let mut pages = BTreeMap::<u64, Arc<RamPage>>::new();
+        let mut max_page = 0;
+        let mut max_generation = 0;
+        let mut restored = Vec::with_capacity(states.len());
+        for state in states {
+            if state.pages.len() * RAM_PAGE_SIZE != state.len {
+                return Err(Error::backend(
+                    "restore durable RAM branch",
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "RAM page manifest length does not match branch size",
+                    ),
+                ));
+            }
+            let mut branch_pages = Vec::with_capacity(state.pages.len());
+            for page in state.pages {
+                max_page = max_page.max(page.id);
+                max_generation = max_generation.max(page.generation);
+                let generation =
+                    Arc::clone(generations.get(&page.generation).ok_or_else(|| {
+                        Error::backend(
+                            "restore durable RAM branch",
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("missing RAM generation {}", page.generation),
+                            ),
+                        )
+                    })?);
+                let generation_len = generation
+                    .file
+                    .metadata()
+                    .map_err(|error| Error::backend("inspect durable RAM generation", error))?
+                    .len();
+                if page.offset % RAM_PAGE_SIZE as u64 != 0
+                    || page.offset.saturating_add(RAM_PAGE_SIZE as u64) > generation_len
+                {
+                    return Err(Error::backend(
+                        "restore durable RAM branch",
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "RAM page {} references an invalid range in generation {}",
+                                page.id, page.generation
+                            ),
+                        ),
+                    ));
+                }
+                let restored_page = if let Some(existing) = pages.get(&page.id) {
+                    if existing.generation.id != page.generation || existing.offset != page.offset {
+                        return Err(Error::backend(
+                            "restore durable RAM branch",
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("RAM page {} has conflicting references", page.id),
+                            ),
+                        ));
+                    }
+                    Arc::clone(existing)
+                } else {
+                    let restored = Arc::new(RamPage {
+                        id: page.id,
+                        generation,
+                        offset: page.offset,
+                    });
+                    pages.insert(page.id, Arc::clone(&restored));
+                    restored
+                };
+                branch_pages.push(restored_page);
+            }
+            restored.push(Self::from_pages(state.len, branch_pages)?);
+        }
+        NEXT_PAGE_ID.fetch_max(max_page.saturating_add(1), Ordering::Relaxed);
+        NEXT_GENERATION_ID.fetch_max(max_generation.saturating_add(1), Ordering::Relaxed);
+        Ok(restored)
+    }
+
     /// Copy the current dirty set while the VM keeps running. Writes racing
     /// these copies remain tracked by KVM and are recopied at the pause barrier.
     pub(crate) fn prepare_fork(&self, pages: &[usize]) -> Result<RamForkPreparation, Error> {
@@ -301,6 +492,12 @@ impl KvmGuestRam {
         let preparation = self.prepare_fork(&[])?;
         self.finish_prepared_pages(preparation, dirty)?
             .materialize()
+    }
+
+    fn seal_pages(&mut self, dirty: BTreeSet<usize>) -> Result<(), Error> {
+        let preparation = self.prepare_fork(&[])?;
+        self.finish_prepared_pages(preparation, dirty)?;
+        Ok(())
     }
 
     fn finish_prepared_pages(
@@ -541,6 +738,107 @@ impl Drop for KvmGuestRam {
             libc::munmap(self.base.as_ptr().cast(), self.len);
         }
     }
+}
+
+fn persist_generation(directory: &Path, generation: &RamGeneration) -> Result<(), Error> {
+    let destination = directory.join(format!("generation-{}", generation.id));
+    if destination.exists() {
+        return Ok(());
+    }
+    let temporary = tempfile::NamedTempFile::new_in(directory)
+        .map_err(|error| Error::backend("create durable RAM generation temporary file", error))?;
+    let len = generation
+        .file
+        .metadata()
+        .map_err(|error| Error::backend("inspect RAM generation", error))?
+        .len();
+    clone_or_copy_generation(&generation.file, temporary.as_file(), len)?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| Error::backend("sync durable RAM generation", error))?;
+    match temporary.persist_noclobber(destination) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(Error::backend(
+            "publish durable RAM generation",
+            error.error,
+        )),
+    }
+}
+
+fn clone_or_copy_generation(source: &File, destination: &File, len: u64) -> Result<(), Error> {
+    const FICLONE: u64 = 0x4004_9409;
+    // SAFETY: FICLONE receives two valid regular-file descriptors. It either
+    // installs a filesystem CoW clone in the empty destination or changes
+    // nothing and reports an error, in which case the sparse-copy fallback is
+    // used.
+    if unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE as _, source.as_raw_fd()) } == 0 {
+        return Ok(());
+    }
+
+    destination
+        .set_len(len)
+        .map_err(|error| Error::backend("size durable RAM generation", error))?;
+    let mut offset = 0_u64;
+    while offset < len {
+        // SAFETY: lseek only queries extent boundaries on a valid regular file.
+        let data =
+            unsafe { libc::lseek(source.as_raw_fd(), offset as libc::off_t, libc::SEEK_DATA) };
+        if data < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENXIO) {
+                return Ok(());
+            }
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                copy_generation_range(source, destination, 0, len)?;
+                return Ok(());
+            }
+            return Err(Error::backend("find RAM generation data extent", error));
+        }
+        let data = data as u64;
+        if data >= len {
+            return Ok(());
+        }
+        // SAFETY: lseek only queries extent boundaries on a valid regular file.
+        let hole = unsafe { libc::lseek(source.as_raw_fd(), data as libc::off_t, libc::SEEK_HOLE) };
+        if hole < 0 {
+            return Err(Error::backend(
+                "find RAM generation hole",
+                io::Error::last_os_error(),
+            ));
+        }
+        let hole = (hole as u64).min(len);
+        if hole <= data {
+            return Err(Error::backend(
+                "copy RAM generation extent",
+                io::Error::new(io::ErrorKind::InvalidData, "invalid sparse-file extent"),
+            ));
+        }
+        copy_generation_range(source, destination, data, hole)?;
+        offset = hole;
+    }
+    Ok(())
+}
+
+fn copy_generation_range(
+    source: &File,
+    destination: &File,
+    mut offset: u64,
+    end: u64,
+) -> Result<(), Error> {
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    while offset < end {
+        let count = usize::try_from((end - offset).min(buffer.len() as u64)).unwrap();
+        source
+            .read_exact_at(&mut buffer[..count], offset)
+            .map_err(|error| Error::backend("read RAM generation for persistence", error))?;
+        destination
+            .write_all_at(&buffer[..count], offset)
+            .map_err(|error| Error::backend("write durable RAM generation", error))?;
+        offset += count as u64;
+    }
+    Ok(())
 }
 
 fn reserve(len: usize) -> Result<NonNull<u8>, Error> {

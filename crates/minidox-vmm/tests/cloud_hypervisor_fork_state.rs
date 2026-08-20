@@ -10,9 +10,13 @@ use minidox_vmm::{KvmSupervisor, RAM_PAGE_SIZE, VmConfig};
 use serde_json::json;
 
 const RAM_SIZE: usize = 512 << 20;
+const COMMAND_OFFSET: usize = 64;
+const EXPECTED_OFFSET: usize = 80;
+const RESPONSE_OFFSET: usize = 96;
+const CONTROL_REGION_LEN: usize = 48;
 
 #[test]
-fn supervisor_forks_running_vm_ram_redoxfs_and_machine_state() {
+fn supervisor_forks_live_guest_processes_with_isolated_cow_filesystems() {
     let Ok(kernel) = env::var("MINIDOX_TEST_KERNEL") else {
         eprintln!("skipping nested lifecycle test: MINIDOX_TEST_KERNEL is unset");
         return;
@@ -41,13 +45,13 @@ fn supervisor_forks_running_vm_ram_redoxfs_and_machine_state() {
     }))
     .unwrap();
 
-    let mut supervisor = KvmSupervisor::new().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let mut supervisor = KvmSupervisor::open(storage.path()).unwrap();
     let source = supervisor.create_cloud_vm(config).unwrap();
     wait_for_console(&console, "Linux version", Duration::from_secs(180));
 
-    let ram_gpa = wait_for_guest_ram_gpa(&console, Duration::from_secs(180));
-    let memory_offset = usize::try_from(ram_gpa - guest_ram_start()).unwrap();
-    assert!(memory_offset + RAM_PAGE_SIZE <= RAM_SIZE);
+    let parent_gpa = wait_for_guest_gpa(&console, "MINIDOX_RAM_GPA=", Duration::from_secs(180));
+    let parent_offset = guest_memory_offset(parent_gpa);
     if env::var_os("MINIDOX_TEST_VIRTIOFS").is_some() {
         wait_for_console(
             &console,
@@ -68,11 +72,18 @@ fn supervisor_forks_running_vm_ram_redoxfs_and_machine_state() {
             Duration::from_secs(180),
         );
     }
+    let worker_gpa = wait_for_guest_gpa(&console, "MINIDOX_WORKER_GPA=", Duration::from_secs(180));
+    let worker_offset = guest_memory_offset(worker_gpa);
+    assert_ne!(parent_offset, worker_offset);
     let _cold = supervisor
         .create_file(source, "cold", RAM_PAGE_SIZE as u64)
         .unwrap();
     assert_eq!(
-        supervisor.read_memory(source, memory_offset, 11).unwrap(),
+        supervisor.read_memory(source, parent_offset, 11).unwrap(),
+        b"before fork"
+    );
+    assert_eq!(
+        supervisor.read_memory(source, worker_offset, 11).unwrap(),
         b"before fork"
     );
 
@@ -89,46 +100,195 @@ fn supervisor_forks_running_vm_ram_redoxfs_and_machine_state() {
     assert_eq!(shared.filesystem.shared_pages, 1);
 
     if env::var_os("MINIDOX_TEST_VIRTIOFS").is_some() {
-        supervisor
-            .write_memory(source, memory_offset + 64, b"cold fault")
-            .unwrap();
-        supervisor
-            .write_memory(child, memory_offset + 64, b"cold fault")
-            .unwrap();
+        for (vm, process_offset) in [
+            (source, parent_offset),
+            (source, worker_offset),
+            (child, parent_offset),
+            (child, worker_offset),
+        ] {
+            issue_guest_command(
+                &mut supervisor,
+                vm,
+                process_offset,
+                b"cold fault",
+                b"",
+                b"cold ok",
+                Duration::from_secs(180),
+            );
+        }
         wait_for_shared_filesystem_pages(&supervisor, 2, 2, Duration::from_secs(180));
     }
 
     supervisor
-        .write_memory(source, memory_offset, b"after fork!")
+        .write_memory(source, parent_offset, b"after fork!")
         .unwrap();
     supervisor
         .write_file(source, state, 128, b"after fork!")
         .unwrap();
     assert_eq!(
-        supervisor.read_memory(child, memory_offset, 11).unwrap(),
+        supervisor.read_memory(child, parent_offset, 11).unwrap(),
         b"before fork"
     );
     assert_eq!(
         supervisor.read_file(child, state, 128, 11).unwrap(),
         b"before fork"
     );
+    if env::var_os("MINIDOX_TEST_VIRTIOFS").is_some() {
+        assert_guest_processes_see(
+            &mut supervisor,
+            source,
+            [parent_offset, worker_offset],
+            b"after fork!",
+        );
+        assert_guest_processes_see(
+            &mut supervisor,
+            child,
+            [parent_offset, worker_offset],
+            b"before fork",
+        );
+    }
+
+    supervisor
+        .write_file(child, state, 128, b"child fork!")
+        .unwrap();
+    assert_eq!(
+        supervisor.read_file(source, state, 128, 11).unwrap(),
+        b"after fork!"
+    );
+    if env::var_os("MINIDOX_TEST_VIRTIOFS").is_some() {
+        assert_guest_processes_see(
+            &mut supervisor,
+            source,
+            [parent_offset, worker_offset],
+            b"after fork!",
+        );
+        assert_guest_processes_see(
+            &mut supervisor,
+            child,
+            [parent_offset, worker_offset],
+            b"child fork!",
+        );
+    }
+
+    supervisor.checkpoint().unwrap();
+    drop(supervisor);
+    let mut supervisor = KvmSupervisor::open(storage.path()).unwrap();
+    assert_eq!(
+        supervisor.read_memory(source, parent_offset, 11).unwrap(),
+        b"after fork!"
+    );
+    assert_eq!(
+        supervisor.read_memory(child, parent_offset, 11).unwrap(),
+        b"before fork"
+    );
+    assert_eq!(
+        supervisor.read_file(source, state, 128, 11).unwrap(),
+        b"after fork!"
+    );
+    assert_eq!(
+        supervisor.read_file(child, state, 128, 11).unwrap(),
+        b"child fork!"
+    );
+    if env::var_os("MINIDOX_TEST_VIRTIOFS").is_some() {
+        assert_guest_processes_see(
+            &mut supervisor,
+            source,
+            [parent_offset, worker_offset],
+            b"after fork!",
+        );
+        assert_guest_processes_see(
+            &mut supervisor,
+            child,
+            [parent_offset, worker_offset],
+            b"child fork!",
+        );
+    }
 
     let grandchild = supervisor.fork_vm(child).unwrap();
     supervisor.remove_vm(source).unwrap();
     supervisor.remove_vm(child).unwrap();
     assert_eq!(
         supervisor
-            .read_memory(grandchild, memory_offset, 11)
+            .read_memory(grandchild, parent_offset, 11)
             .unwrap(),
         b"before fork"
     );
     assert_eq!(
         supervisor.read_file(grandchild, state, 128, 11).unwrap(),
-        b"before fork"
+        b"child fork!"
     );
+    if env::var_os("MINIDOX_TEST_VIRTIOFS").is_some() {
+        assert_guest_processes_see(
+            &mut supervisor,
+            grandchild,
+            [parent_offset, worker_offset],
+            b"child fork!",
+        );
+    }
 
     supervisor.remove_vm(grandchild).unwrap();
     fs::remove_file(console).unwrap();
+}
+
+fn assert_guest_processes_see(
+    supervisor: &mut KvmSupervisor,
+    vm: minidox_vmm::KvmVmId,
+    process_offsets: [usize; 2],
+    expected: &[u8],
+) {
+    for process_offset in process_offsets {
+        issue_guest_command(
+            supervisor,
+            vm,
+            process_offset,
+            b"check state",
+            expected,
+            b"state ok",
+            Duration::from_secs(30),
+        );
+    }
+}
+
+fn issue_guest_command(
+    supervisor: &mut KvmSupervisor,
+    vm: minidox_vmm::KvmVmId,
+    process_offset: usize,
+    command: &[u8],
+    expected: &[u8],
+    success: &[u8],
+    timeout: Duration,
+) {
+    assert!(command.len() <= EXPECTED_OFFSET - COMMAND_OFFSET);
+    assert!(expected.len() <= RESPONSE_OFFSET - EXPECTED_OFFSET);
+    let mut region = [0_u8; CONTROL_REGION_LEN];
+    region[..command.len()].copy_from_slice(command);
+    let expected_start = EXPECTED_OFFSET - COMMAND_OFFSET;
+    region[expected_start..expected_start + expected.len()].copy_from_slice(expected);
+    supervisor
+        .write_memory(vm, process_offset + COMMAND_OFFSET, &region)
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    while started.elapsed() < timeout {
+        let response = supervisor
+            .read_memory(vm, process_offset + RESPONSE_OFFSET, 16)
+            .unwrap();
+        if response.starts_with(success) {
+            return;
+        }
+        if response.starts_with(b"state bad") || response.starts_with(b"cold bad") {
+            panic!(
+                "guest process at RAM offset {process_offset:#x} rejected command {:?}: {:?}",
+                String::from_utf8_lossy(command),
+                String::from_utf8_lossy(&response)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!(
+        "guest process at RAM offset {process_offset:#x} did not complete command {:?} within {timeout:?}",
+        String::from_utf8_lossy(command)
+    );
 }
 
 fn wait_for_shared_filesystem_pages(
@@ -174,12 +334,12 @@ fn wait_for_console(path: &PathBuf, marker: &str, timeout: Duration) {
     );
 }
 
-fn wait_for_guest_ram_gpa(path: &PathBuf, timeout: Duration) -> u64 {
+fn wait_for_guest_gpa(path: &PathBuf, marker: &str, timeout: Duration) -> u64 {
     let started = std::time::Instant::now();
     while started.elapsed() < timeout {
         let contents = fs::read_to_string(path).unwrap_or_default();
         if let Some(value) = contents.lines().find_map(|line| {
-            line.strip_prefix("MINIDOX_RAM_GPA=")
+            line.strip_prefix(marker)
                 .and_then(|value| value.strip_prefix("0x"))
                 .and_then(|value| u64::from_str_radix(value, 16).ok())
         }) {
@@ -193,7 +353,13 @@ fn wait_for_guest_ram_gpa(path: &PathBuf, timeout: Duration) -> u64 {
         }
         thread::sleep(Duration::from_millis(50));
     }
-    panic!("guest console did not report a RAM GPA within {timeout:?}");
+    panic!("guest console did not report {marker:?} within {timeout:?}");
+}
+
+fn guest_memory_offset(gpa: u64) -> usize {
+    let offset = usize::try_from(gpa - guest_ram_start()).unwrap();
+    assert!(offset + RAM_PAGE_SIZE <= RAM_SIZE);
+    offset
 }
 
 const fn guest_ram_start() -> u64 {
